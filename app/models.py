@@ -503,3 +503,82 @@ class LoadingActualCorrection(Base):
         UniqueConstraint("actuals_id", "request_id",
                          name="uq_actual_correction_request"),
     )
+
+
+class LoadingHandover(Base):
+    """装船完结交接时签发的**不可变凭证**头（交接号全局唯一）。
+
+    仅对已确认（confirmed）、已有登记实绩，且每箱均在截止分钟前完工、截止后无
+    有效事件、逐箱相对冻结排程基线的完工延误均不超过阈值的方案签发。签发时在
+    写事务内复核方案仍已确认、实绩版本与有效事件（指纹）未变；凭证内容（方案
+    修订、各箱实际起止与岸桥、冻结基线、偏差、截止分钟、实绩指纹）整体冻结，
+    此后实绩更正/补登不改凭证，仅在查询时标示是否仍对应当前实绩。
+    """
+
+    __tablename__ = "loading_handovers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_new_id)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    handover_no: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    cutoff_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_actual_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_finish_delay_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_observed_finish_delay: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 签发时各有效流水号（升序，JSON 文本）
+    valid_seqs: Mapped[str] = mapped_column(Text, nullable=False)
+    # 签发时实绩指纹（规范 SHA-256），查询时与当前实绩指纹比对
+    actuals_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["LoadingHandoverItem"]] = relationship(
+        back_populates="handover", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("cutoff_minute >= 0", name="ck_handover_cutoff"),
+        CheckConstraint("expected_actual_version >= 1",
+                        name="ck_handover_expected_version"),
+        CheckConstraint("actual_version >= 1", name="ck_handover_actual_version"),
+        CheckConstraint("max_finish_delay_minutes >= 0",
+                        name="ck_handover_max_delay"),
+        CheckConstraint("max_observed_finish_delay >= 0",
+                        name="ck_handover_observed_delay"),
+        CheckConstraint("container_count >= 0", name="ck_handover_container_count"),
+        Index("ix_loading_handovers_plan", "plan_id"),
+    )
+
+
+class LoadingHandoverItem(Base):
+    """凭证逐箱快照：实际起止与岸桥、冻结基线及完工延误偏差（签发后不可变）。"""
+
+    __tablename__ = "loading_handover_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    handover_id: Mapped[str] = mapped_column(
+        ForeignKey("loading_handovers.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_delta_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    finish_delta_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    crane_changed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    handover: Mapped[LoadingHandover] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("handover_id", "container_no",
+                         name="uq_handover_item_container"),
+    )

@@ -12,6 +12,8 @@ from app.schemas import (
     ActualEventRegisterIn,
     ActualsOut,
     AssignmentOut,
+    HandoverCreateIn,
+    HandoverOut,
     ManifestIn,
     ManifestRevisionOut,
     MessageOut,
@@ -418,3 +420,60 @@ def correct_actual_event(
 def get_actuals(plan_id: str, db: Session = Depends(get_db)):
     actuals = services.get_actuals(db, plan_id)
     return services.build_actuals_out(db, actuals)
+
+
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+@router.post(
+    "/plans/{plan_id}/handovers",
+    response_model=HandoverOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="装船完结交接：申请不可变凭证（截止前全完工、无截止后事件、完工延误不超阈值）",
+)
+def issue_loading_handover(
+    plan_id: str,
+    body: HandoverCreateIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    handover, idempotent_hit = services.issue_loading_handover(db, plan_id, body)
+    # 同交接号同内容重试返回原凭证（200）；新凭证签发为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return services.build_handover_out(db, handover)
+
+
+@router.get(
+    "/plans/{plan_id}/handovers",
+    response_model=list[HandoverOut],
+    responses={404: {"model": MessageOut}},
+    summary="列出某方案的装船完结交接凭证（历史凭证仍可读）",
+)
+def list_plan_handovers(plan_id: str, db: Session = Depends(get_db)):
+    handovers = services.list_plan_handovers(db, plan_id)
+    return [services.build_handover_out(db, h) for h in handovers]
+
+
+@router.get(
+    "/plans/{plan_id}/handovers/{handover_id}",
+    response_model=HandoverOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询单个交接凭证（内容不可变；标示是否仍对应当前实绩）",
+)
+def get_plan_handover(
+    plan_id: str, handover_id: str, db: Session = Depends(get_db)
+):
+    handover = services.get_plan_handover(db, plan_id, handover_id)
+    return services.build_handover_out(db, handover)
+
+
+@router.get(
+    "/handovers/{handover_id}",
+    response_model=HandoverOut,
+    responses={404: {"model": MessageOut}},
+    summary="按凭证号查询交接凭证（全局，历史凭证仍可读）",
+)
+def get_handover(handover_id: str, db: Session = Depends(get_db)):
+    handover = services.get_handover_by_pk(db, handover_id)
+    return services.build_handover_out(db, handover)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -37,10 +38,12 @@ from app.unloader import (
 
 
 class BusinessError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
+    def __init__(self, message: str, status_code: int = 400, extra: dict | None = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        # 附加结构化字段（如超限箱与偏差），随 {"detail": ..., **extra} 一并返回
+        self.extra = extra
 
 
 class ConflictError(Exception):
@@ -1594,3 +1597,390 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+FINGERPRINT_ALGORITHM = "sha256"
+
+
+def _actuals_fingerprint(version: int, event_rows) -> str:
+    """对当前有效实绩计算规范指纹：版本 + 各事件现行（流水号, 类型, 箱, 桥, 分钟）。
+
+    event_rows 为 (seq, event_type, container_no, crane_no, minute) 可迭代对象，
+    取事件**当前生效**值（更正后为替代值）；按流水号升序规范化后 SHA-256。
+    """
+    payload = {
+        "version": version,
+        "events": sorted(
+            ((r[0], r[1], r[2], r[3], r[4]) for r in event_rows),
+            key=lambda x: x[0],
+        ),
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def issue_loading_handover(
+    db: Session,
+    plan_id: str,
+    payload,
+) -> tuple[models.LoadingHandover, bool]:
+    """装船完结交接：为已确认方案的已登记实绩签发不可变凭证。
+
+    仅接受方案仍 confirmed、实绩版本等于期望版本、有效流水号集合与登记一致、
+    每箱均在截止分钟前（含）完工且截止后无有效事件、逐箱按冻结排程基线计算的
+    完工延误均不超过阈值的申请；任一业务条件不满足均不生成凭证。生成前在
+    BEGIN IMMEDIATE 写事务内复核方案仍已确认、实绩版本及有效事件未变（指纹）。
+    同交接号同内容重试（即使其后实绩版本已被更正推进）返回原凭证；同交接号
+    异内容冲突（409）。返回 (凭证 ORM 对象, 是否幂等重试命中)。
+    """
+    expected_version = payload.expected_actual_version
+    cutoff = payload.cutoff_minute
+    threshold = payload.max_finish_delay_minutes
+    requested_seqs = sorted(payload.valid_seqs)
+    handover_no = payload.handover_no
+
+    # 锁前仅做存在性预检（404）；方案状态等业务判定全部在写锁内完成，
+    # 保证“同号同内容重试优先返回原凭证”且不读到并发更正/补登的中间快照。
+    get_plan(db, plan_id)
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    handover_pk: str | None = None
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 幂等/冲突优先：交接号全局唯一，先判定是否已有同号凭证
+        cursor.execute(
+            "SELECT id, plan_id, cutoff_minute, expected_actual_version, valid_seqs, "
+            "max_finish_delay_minutes FROM loading_handovers WHERE handover_no = ?",
+            (handover_no,),
+        )
+        existing = cursor.fetchone()
+
+        # 锁内复核：方案仍存在且仍已确认
+        cursor.execute("SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,))
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked, revision_no_locked = prow
+        if plan_status_locked != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"方案当前状态为 {plan_status_locked}：未确认或已被取代的方案"
+                "拒绝装船完结交接"
+            )
+
+        if existing is not None:
+            same = (
+                existing[1] == plan_id
+                and existing[2] == cutoff
+                and existing[3] == expected_version
+                and json.loads(existing[4]) == requested_seqs
+                and existing[5] == threshold
+            )
+            if not same:
+                conn.rollback()
+                raise ConflictError(
+                    f"交接号 {handover_no} 已用于一次不同的交接申请"
+                    + ("（属于另一方案）" if existing[1] != plan_id else "（内容不同）")
+                    + "，同交接号异内容冲突，本次申请被拒绝且不生成新凭证"
+                )
+            # 同交接号同内容：重试，直接返回原凭证，不重新评估后续条件
+            idempotent_hit = True
+            handover_pk = existing[0]
+            conn.commit()
+        else:
+            cursor.execute(
+                "SELECT id, version, baseline_crane_count FROM loading_actuals "
+                "WHERE plan_id = ?",
+                (plan_id,),
+            )
+            hrow = cursor.fetchone()
+            if hrow is None:
+                conn.rollback()
+                raise ConflictError(
+                    f"方案 {plan_id} 尚无已登记装船实绩，拒绝装船完结交接"
+                )
+            actuals_id_locked, version_locked, crane_count_locked = hrow
+
+            cursor.execute(
+                "SELECT seq, event_type, container_no, crane_no, minute, id "
+                "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
+                (actuals_id_locked,),
+            )
+            event_rows = cursor.fetchall()
+            seqs_locked = sorted(r[0] for r in event_rows)
+            if set(seqs_locked) != set(requested_seqs):
+                unknown = sorted(set(requested_seqs) - set(seqs_locked))
+                missing = sorted(set(seqs_locked) - set(requested_seqs))
+                problems = []
+                if unknown:
+                    problems.append(f"提交含未登记流水号：{', '.join(map(str, unknown))}")
+                if missing:
+                    problems.append(f"遗漏已登记有效流水号：{', '.join(map(str, missing))}")
+                conn.rollback()
+                raise ConflictError(
+                    "有效流水号集合与当前已登记实绩不一致（"
+                    + "；".join(problems) + "），拒绝装船完结交接"
+                )
+
+            if version_locked != expected_version:
+                conn.rollback()
+                raise ConflictError(
+                    f"期望实绩版本 {expected_version} 已过期：当前版本为 "
+                    f"{version_locked}，请基于最新实绩重新申请交接凭证"
+                )
+
+            cursor.execute(
+                "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+                (plan_id,),
+            )
+            plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+            events = [
+                ActualEvent(
+                    seq=r[0], event_type=r[1], container_no=r[2],
+                    crane_no=r[3], minute=r[4], arrival_id=r[5],
+                )
+                for r in event_rows
+            ]
+            replay_result = replay_actuals(events, plan_items, crane_count_locked)
+            boxes = replay_result["boxes"]
+            fingerprint_locked = _actuals_fingerprint(version_locked, event_rows)
+
+            # 截止条件：每箱在截止前（含）完工，且截止后无有效事件
+            unfinished = [no for no in sorted(boxes) if boxes[no].status != "finished"]
+            finished_after = sorted(
+                no for no, b in boxes.items()
+                if b.status == "finished" and b.finish_minute > cutoff
+            )
+            events_after = sorted(
+                (e for e in events if e.minute > cutoff),
+                key=lambda e: (e.minute, 0 if e.event_type == "finish" else 1,
+                               e.arrival_id),
+            )
+            if unfinished or finished_after or events_after:
+                conn.rollback()
+                extra = {
+                    "unfinished_containers": unfinished,
+                    "finished_after_cutoff": [
+                        {"container_no": no,
+                         "actual_finish_minute": boxes[no].finish_minute}
+                        for no in finished_after
+                    ],
+                    "events_after_cutoff": [
+                        {"seq": e.seq, "event_type": e.event_type,
+                         "container_no": e.container_no, "minute": e.minute}
+                        for e in events_after
+                    ],
+                    "cutoff_minute": cutoff,
+                }
+                raise BusinessError(
+                    "不满足截止条件：每箱均须在截止分钟前（含）完工且截止后无有效"
+                    "事件，本次交接被拒绝且不生成凭证",
+                    422,
+                    extra=extra,
+                )
+
+            # 逐箱以冻结排程基线计算完工延误（仅延后计为延误，提前不计）
+            cursor.execute(
+                "SELECT container_no, stack, tier, start_minute, finish_minute, "
+                "crane_no FROM loading_actual_baseline_items WHERE actuals_id = ?",
+                (actuals_id_locked,),
+            )
+            baseline_by_no = {r[0]: r for r in cursor.fetchall()}
+            item_snapshot = []
+            exceeded = []
+            max_delay = 0
+            for no in sorted(boxes):
+                box = boxes[no]
+                base = baseline_by_no.get(no)
+                if base is None:  # 防御：首次登记冻结基线覆盖排程全部箱
+                    conn.rollback()
+                    raise BusinessError(
+                        f"箱 {no} 缺少冻结排程基线，数据不一致，拒绝交接", 500
+                    )
+                # base: (cno, stack, tier, base_start, base_finish, base_crane)
+                start_delta = box.start_minute - base[3]
+                finish_delta = box.finish_minute - base[4]
+                delay = max(0, finish_delta)
+                max_delay = max(max_delay, delay)
+                crane_changed = box.crane_no != base[5]
+                item_snapshot.append((
+                    no, box.stack, box.tier,
+                    box.start_minute, box.finish_minute, box.crane_no,
+                    base[3], base[4], base[5],
+                    start_delta, finish_delta, 1 if crane_changed else 0,
+                ))
+                if delay > threshold:
+                    exceeded.append({
+                        "container_no": no,
+                        "baseline_finish_minute": base[4],
+                        "actual_finish_minute": box.finish_minute,
+                        "finish_delta_minutes": finish_delta,
+                        "delay_minutes": delay,
+                        "allowed_max_delay_minutes": threshold,
+                    })
+            if exceeded:
+                conn.rollback()
+                raise BusinessError(
+                    f"存在 {len(exceeded)} 箱完工延误超过允许阈值 {threshold} 分钟，"
+                    "本次交接被拒绝且不生成凭证",
+                    422,
+                    extra={
+                        "cutoff_minute": cutoff,
+                        "allowed_max_delay_minutes": threshold,
+                        "exceeded_containers": exceeded,
+                    },
+                )
+
+            # 全部条件满足：固化凭证（方案修订号、各箱实际起止与岸桥、冻结基线、
+            # 偏差、截止分钟与实绩指纹均随凭证不可变）
+            handover_pk = models._new_id()
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor.execute(
+                "INSERT INTO loading_handovers "
+                "(id, plan_id, handover_no, cutoff_minute, expected_actual_version, "
+                "actual_version, max_finish_delay_minutes, max_observed_finish_delay, "
+                "revision_no, container_count, valid_seqs, actuals_fingerprint, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (handover_pk, plan_id, handover_no, cutoff, expected_version,
+                 version_locked, threshold, max_delay, revision_no_locked,
+                 len(item_snapshot), json.dumps(requested_seqs),
+                 fingerprint_locked, now),
+            )
+            cursor.executemany(
+                "INSERT INTO loading_handover_items "
+                "(handover_id, container_no, stack, tier, actual_start_minute, "
+                "actual_finish_minute, actual_crane_no, baseline_start_minute, "
+                "baseline_finish_minute, baseline_crane_no, start_delta_minutes, "
+                "finish_delta_minutes, crane_changed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(handover_pk, *row12) for row12 in item_snapshot],
+            )
+            conn.commit()
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_handover_by_pk(db, handover_pk), idempotent_hit
+
+
+def get_handover_by_pk(db: Session, handover_id: str) -> models.LoadingHandover:
+    handover = db.get(models.LoadingHandover, handover_id)
+    if handover is None:
+        raise BusinessError(f"交接凭证 {handover_id} 不存在", 404)
+    return handover
+
+
+def list_plan_handovers(db: Session, plan_id: str) -> list[models.LoadingHandover]:
+    get_plan(db, plan_id)  # 方案不存在 -> 404
+    return list(db.scalars(
+        select(models.LoadingHandover)
+        .where(models.LoadingHandover.plan_id == plan_id)
+        .order_by(models.LoadingHandover.created_at, models.LoadingHandover.id)
+    ))
+
+
+def get_plan_handover(
+    db: Session, plan_id: str, handover_id: str
+) -> models.LoadingHandover:
+    handover = get_handover_by_pk(db, handover_id)
+    if handover.plan_id != plan_id:
+        raise BusinessError(f"交接凭证 {handover_id} 不存在", 404)
+    return handover
+
+
+def build_handover_out(db: Session, handover: models.LoadingHandover) -> dict:
+    """组装凭证响应：冻结内容 + 当前实绩匹配标示（指纹比对）。"""
+    actuals = db.scalar(
+        select(models.LoadingActuals).where(
+            models.LoadingActuals.plan_id == handover.plan_id
+        )
+    )
+    current_version = None
+    current_fingerprint = None
+    matches = False
+    if actuals is not None:
+        current_version = actuals.version
+        current_fingerprint = _actuals_fingerprint(
+            actuals.version,
+            [(e.seq, e.event_type, e.container_no, e.crane_no, e.minute)
+             for e in actuals.events],
+        )
+        matches = current_fingerprint == handover.actuals_fingerprint
+
+    return assemble_handover_out(
+        handover,
+        matches_current=matches,
+        current_version=current_version,
+        current_fingerprint=current_fingerprint,
+    )
+
+
+def assemble_handover_out(
+    handover: models.LoadingHandover,
+    *,
+    matches_current: bool,
+    current_version: int | None,
+    current_fingerprint: str | None,
+) -> dict:
+    containers = [
+        {
+            "container_no": i.container_no,
+            "stack": i.stack,
+            "tier": i.tier,
+            "actual_start_minute": i.actual_start_minute,
+            "actual_finish_minute": i.actual_finish_minute,
+            "actual_crane_no": i.actual_crane_no,
+            "baseline_start_minute": i.baseline_start_minute,
+            "baseline_finish_minute": i.baseline_finish_minute,
+            "baseline_crane_no": i.baseline_crane_no,
+            "start_delta_minutes": i.start_delta_minutes,
+            "finish_delta_minutes": i.finish_delta_minutes,
+            "crane_changed": bool(i.crane_changed),
+        }
+        for i in sorted(handover.items, key=lambda x: x.container_no)
+    ]
+    return {
+        "handover_id": handover.id,
+        "handover_no": handover.handover_no,
+        "plan_id": handover.plan_id,
+        "revision_no": handover.revision_no,
+        "cutoff_minute": handover.cutoff_minute,
+        "expected_actual_version": handover.expected_actual_version,
+        "actual_version": handover.actual_version,
+        "max_finish_delay_minutes": handover.max_finish_delay_minutes,
+        "max_observed_finish_delay": handover.max_observed_finish_delay,
+        "valid_seqs": json.loads(handover.valid_seqs),
+        "actuals_fingerprint": handover.actuals_fingerprint,
+        "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
+        "containers": containers,
+        "summary": {
+            "container_count": handover.container_count,
+            "cutoff_minute": handover.cutoff_minute,
+            "actual_version": handover.actual_version,
+            "max_finish_delay_minutes": handover.max_finish_delay_minutes,
+            "max_observed_finish_delay": handover.max_observed_finish_delay,
+            "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
+        },
+        "matches_current_actuals": matches_current,
+        "current_actual_version": current_version,
+        "current_fingerprint": current_fingerprint,
+        "created_at": utc_iso(handover.created_at),
+    }
