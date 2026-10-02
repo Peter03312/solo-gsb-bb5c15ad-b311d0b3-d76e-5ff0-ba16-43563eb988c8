@@ -1,0 +1,1596 @@
+"""业务服务层。"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app import models
+from app.actuals import ActualEvent, ActualsReplayError, replay as replay_actuals
+from app.schemas import (
+    ActualEventCorrectionIn,
+    ActualEventRegisterIn,
+    ManifestIn,
+    PlanConfirmIn,
+    RestowCreateIn,
+    ScheduleCreateIn,
+    SlotDataIn,
+    UnloadingCreateIn,
+)
+from app.scheduler import InfeasibleSchedule, Job, solve_loading
+from app.solver import (
+    Container,
+    InfeasibleStowage,
+    Slot,
+    solve_restow,
+    solve_stowage,
+)
+from app.unloader import (
+    InfeasibleUnloading,
+    PlacedContainer,
+    PortWindow,
+    solve_unloading,
+)
+
+
+class BusinessError(Exception):
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class ConflictError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+# ---------- 资料修订 ----------
+
+
+def create_slot_revision(db: Session, data: SlotDataIn) -> models.SlotRevision:
+    next_rev = (db.scalar(select(func.max(models.SlotRevision.revision))) or 0) + 1
+    rev = models.SlotRevision(
+        revision=next_rev,
+        min_moment=data.min_moment,
+        max_moment=data.max_moment,
+    )
+    for s in data.slots:
+        rev.slots.append(
+            models.SlotRow(
+                code=s.code, stack=s.stack, tier=s.tier,
+                capacity=s.capacity, arm=s.arm,
+            )
+        )
+    for a, b in {tuple(sorted(p)) for p in data.adjacency}:
+        rev.adjacencies.append(models.AdjacencyRow(slot_a=a, slot_b=b))
+    for a, b in {
+        tuple(sorted((p[0].strip(), p[1].strip())))
+        for p in data.incompatible_classes
+    }:
+        rev.incompatibilities.append(models.IncompatRow(class_a=a, class_b=b))
+    db.add(rev)
+    db.commit()
+    db.refresh(rev)
+    return rev
+
+
+def create_manifest_revision(db: Session, data: ManifestIn) -> models.ManifestRevision:
+    next_rev = (db.scalar(select(func.max(models.ManifestRevision.revision))) or 0) + 1
+    rev = models.ManifestRevision(revision=next_rev)
+    for c in data.containers:
+        rev.containers.append(
+            models.ContainerRow(
+                no=c.no,
+                weight=c.weight,
+                hazmat=c.hazmat,
+                discharge_order=c.discharge_order,
+            )
+        )
+    db.add(rev)
+    db.commit()
+    db.refresh(rev)
+    return rev
+
+
+def get_slot_revision(db: Session, revision: int | None) -> models.SlotRevision:
+    if revision is None:
+        rev = db.scalar(
+            select(models.SlotRevision).order_by(models.SlotRevision.revision.desc())
+        )
+    else:
+        rev = db.scalar(
+            select(models.SlotRevision).where(models.SlotRevision.revision == revision)
+        )
+    if rev is None:
+        raise BusinessError(f"槽位资料修订 {revision} 不存在", 404)
+    return rev
+
+
+def get_manifest_revision(db: Session, revision: int | None) -> models.ManifestRevision:
+    if revision is None:
+        rev = db.scalar(
+            select(models.ManifestRevision).order_by(
+                models.ManifestRevision.revision.desc()
+            )
+        )
+    else:
+        rev = db.scalar(
+            select(models.ManifestRevision).where(
+                models.ManifestRevision.revision == revision
+            )
+        )
+    if rev is None:
+        raise BusinessError(f"箱清单修订 {revision} 不存在", 404)
+    return rev
+
+
+def _to_solver_inputs(slot_rev, manifest_rev):
+    slots = [
+        Slot(
+            code=r.code, stack=r.stack, tier=r.tier,
+            capacity=r.capacity, arm=r.arm,
+        )
+        for r in slot_rev.slots
+    ]
+    containers = [
+        Container(
+            no=r.no, weight=r.weight, hazmat=r.hazmat,
+            discharge_order=r.discharge_order,
+        )
+        for r in manifest_rev.containers
+    ]
+    adjacency = [(r.slot_a, r.slot_b) for r in slot_rev.adjacencies]
+    incompat = [(r.class_a, r.class_b) for r in slot_rev.incompatibilities]
+    return slots, containers, adjacency, incompat
+
+
+# ---------- 方案 ----------
+
+
+def _save_plan(
+    db: Session,
+    *,
+    slots_rev,
+    manifest_rev,
+    result,
+    parent: models.Plan | None,
+    status: str = "draft",
+) -> models.Plan:
+    new_id = models._new_id()
+    plan = models.Plan(
+        id=new_id,
+        root_id=parent.root_id if parent else new_id,
+        revision_no=(parent.revision_no + 1) if parent else 1,
+        status=status,
+        slots_revision=slots_rev.revision,
+        manifest_revision=manifest_rev.revision,
+        total_moment=result.total_moment,
+        max_tier=result.max_occupied_tier,
+        parent_id=parent.id if parent else None,
+    )
+    for a in result.assignments:
+        plan.items.append(
+            models.PlanItem(
+                container_no=a.container_no,
+                slot_code=a.slot_code,
+                stack=a.stack,
+                tier=a.tier,
+            )
+        )
+    db.add(plan)
+    db.flush()
+    return plan
+
+
+def compute_plan(
+    db: Session,
+    *,
+    slots_revision: int | None,
+    manifest_revision: int | None,
+    parent_id: str | None = None,
+) -> models.Plan:
+    slot_rev = get_slot_revision(db, slots_revision)
+    manifest_rev = get_manifest_revision(db, manifest_revision)
+    parent = None
+    if parent_id is not None:
+        parent = db.get(models.Plan, parent_id)
+        if parent is None:
+            raise BusinessError(f"方案 {parent_id} 不存在", 404)
+
+    slots, containers, adjacency, incompat = _to_solver_inputs(slot_rev, manifest_rev)
+    try:
+        result = solve_stowage(
+            containers, slots, adjacency, incompat,
+            slot_rev.min_moment, slot_rev.max_moment,
+        )
+    except InfeasibleStowage as exc:
+        raise BusinessError(f"无解：{exc.reason}", 422)
+
+    plan = _save_plan(
+        db, slots_rev=slot_rev, manifest_rev=manifest_rev,
+        result=result, parent=parent,
+    )
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def list_plans(db: Session, root_id: str | None = None) -> list[models.Plan]:
+    stmt = select(models.Plan).order_by(
+        models.Plan.root_id, models.Plan.revision_no
+    )
+    if root_id:
+        stmt = stmt.where(models.Plan.root_id == root_id)
+    return list(db.scalars(stmt))
+
+
+def get_plan(db: Session, plan_id: str) -> models.Plan:
+    plan = db.get(models.Plan, plan_id)
+    if plan is None:
+        raise BusinessError(f"方案 {plan_id} 不存在", 404)
+    return plan
+
+
+def confirm_plan(
+    db: Session,
+    plan_id: str,
+    payload: PlanConfirmIn,
+) -> models.Plan:
+    plan = get_plan(db, plan_id)
+
+    if plan.status == "confirmed":
+        # 幂等：同一方案以其自身资料修订重复确认，直接返回
+        if (
+            payload.slots_revision == plan.slots_revision
+            and payload.manifest_revision == plan.manifest_revision
+        ):
+            return plan
+        raise ConflictError("方案已确认，不能重复确认（如资料已更新请修订方案后重新确认）")
+
+    # 核对参与方案的箱与槽位资料修订；过期则拒绝，原方案保持草稿不变
+    latest_slots = _latest_slot_revision(db)
+    latest_manifest = _latest_manifest_revision(db)
+    if payload.slots_revision != plan.slots_revision:
+        raise ConflictError(
+            f"提交的槽位资料修订 {payload.slots_revision} 与方案修订 "
+            f"{plan.slots_revision} 不一致，拒绝确认"
+        )
+    if payload.manifest_revision != plan.manifest_revision:
+        raise ConflictError(
+            f"提交的箱清单修订 {payload.manifest_revision} 与方案修订 "
+            f"{plan.manifest_revision} 不一致，拒绝确认"
+        )
+    if plan.slots_revision != latest_slots:
+        raise ConflictError(
+            f"槽位资料已过期：方案基于修订 {plan.slots_revision}，"
+            f"当前最新修订 {latest_slots}，原方案保持不变"
+        )
+    if plan.manifest_revision != latest_manifest:
+        raise ConflictError(
+            f"箱清单已过期：方案基于修订 {plan.manifest_revision}，"
+            f"当前最新修订 {latest_manifest}，原方案保持不变"
+        )
+
+    # 读检查完成后快照本方案占用槽位，并释放只读事务；
+    # 随后在独立连接上以 IMMEDIATE 立即拿写锁，串行化并发确认；
+    # 槽位唯一索引兜底冲突占用。锁内不使用 ORM 会话，避免隐式事务干扰。
+    plan_slots = tuple(i.slot_code for i in plan.items)
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute(
+            "SELECT status, revision_no, root_id FROM plans WHERE id = ?",
+            (plan.id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在确认期间被删除，确认被拒绝")
+        status_locked, rev_no_locked, root_locked = row
+        if status_locked != "draft":
+            conn.rollback()
+            raise ConflictError(
+                f"方案状态已为 {status_locked}（并发操作），本次确认被拒绝，原方案不变"
+            )
+
+        cursor.execute(
+            "SELECT id FROM plans WHERE root_id = ? AND status = 'confirmed' "
+            "AND revision_no > ? LIMIT 1",
+            (root_locked, rev_no_locked),
+        )
+        if cursor.fetchone() is not None:
+            conn.rollback()
+            raise ConflictError(
+                "同一方案已存在更新的已确认修订，本次确认被拒绝，原方案不变"
+            )
+
+        # 同根旧已确认修订释放槽位占用并标记为被取代
+        cursor.execute(
+            "SELECT id FROM plans WHERE root_id = ? AND status = 'confirmed'",
+            (root_locked,),
+        )
+        old_ids = [r[0] for r in cursor.fetchall()]
+        for old_id in old_ids:
+            cursor.execute("DELETE FROM confirmed_slots WHERE plan_id = ?", (old_id,))
+            cursor.execute(
+                "UPDATE plans SET status = 'superseded' WHERE id = ?", (old_id,)
+            )
+            # 旧修订的装船排程保留可查，但不再列为当前排程
+            cursor.execute(
+                "UPDATE loading_schedules SET status = 'historical' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
+            # 旧修订的逐港卸箱顺序同样保留可查，但不再列为当前顺序
+            cursor.execute(
+                "UPDATE unloading_sequences SET status = 'historical' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
+
+        # 冲突预检：本方案占用槽位是否已被其他方案的确认占用
+        conflict_slot = None
+        if plan_slots:
+            placeholders = ",".join("?" for _ in plan_slots)
+            cursor.execute(
+                f"SELECT slot_code FROM confirmed_slots WHERE slot_code IN "
+                f"({placeholders})",
+                plan_slots,
+            )
+            row_conflict = cursor.fetchone()
+            conflict_slot = row_conflict[0] if row_conflict else None
+        if conflict_slot is not None:
+            conn.rollback()
+            raise ConflictError(
+                f"并发确认冲突：槽位 {conflict_slot} 已被其他已确认方案占用，"
+                "本次确认被拒绝，原方案不变"
+            )
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "UPDATE plans SET status = 'confirmed', confirmed_at = ? WHERE id = ?",
+            (now, plan.id),
+        )
+        cursor.executemany(
+            "INSERT INTO confirmed_slots (plan_id, slot_code) VALUES (?, ?)",
+            [(plan.id, i.slot_code) for i in plan.items],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_plan(db, plan_id)
+
+
+def _latest_slot_revision(db: Session) -> int:
+    return db.scalar(select(func.max(models.SlotRevision.revision))) or 0
+
+
+def _latest_manifest_revision(db: Session) -> int:
+    return db.scalar(select(func.max(models.ManifestRevision.revision))) or 0
+
+
+# ---------- 应急改配 ----------
+
+
+def create_emergency_restow(
+    db: Session,
+    plan_id: str,
+    payload: RestowCreateIn,
+) -> dict:
+    """码头临时封锁槽位：基于当前已确认方案计算应急改配草稿。
+
+    方案所用槽位资料与箱清单须均为当前最新修订；封锁编号须属于该槽位修订；
+    保持全部箱及其资料、封锁槽位不得占用，并满足全部既有配载硬约束。
+    先最小化换槽箱数，再最小化最高占用层，最后按箱号升序取槽位编号序列
+    字典序最小。无完整可行改配返回 422 且不保存；求解后保存前若基础方案
+    被取代、同根出现更新修订或基础资料变化，返回 409 且不保存。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，应急改配仅可基于当前已确认方案"
+        )
+
+    latest_slots = _latest_slot_revision(db)
+    latest_manifest = _latest_manifest_revision(db)
+    if plan.slots_revision != latest_slots:
+        raise ConflictError(
+            f"槽位资料已更新：当前已确认方案基于修订 {plan.slots_revision}，"
+            f"最新修订 {latest_slots}，请先按最新资料修订并确认方案后再申请应急改配"
+        )
+    if plan.manifest_revision != latest_manifest:
+        raise ConflictError(
+            f"箱清单已更新：当前已确认方案基于修订 {plan.manifest_revision}，"
+            f"最新修订 {latest_manifest}，请先按最新资料修订并确认方案后再申请应急改配"
+        )
+
+    slot_rev = get_slot_revision(db, latest_slots)
+    manifest_rev = get_manifest_revision(db, latest_manifest)
+
+    valid_codes = {s.code for s in slot_rev.slots}
+    unknown = sorted({c for c in payload.blocked_slots if c not in valid_codes})
+    if unknown:
+        raise BusinessError(
+            f"封锁槽位编号不属于槽位资料修订 {latest_slots}：{', '.join(unknown)}（无效槽位）",
+            422,
+        )
+
+    # 改配前后箱清单必须与基础方案完全一致（资料须为最新修订）
+    plan_nos = {i.container_no for i in plan.items}
+    manifest_nos = {c.no for c in manifest_rev.containers}
+    if plan_nos != manifest_nos:
+        missing = sorted(plan_nos - manifest_nos)
+        extra = sorted(manifest_nos - plan_nos)
+        problems = []
+        if missing:
+            problems.append(f"方案箱在最新清单中缺失：{', '.join(missing)}")
+        if extra:
+            problems.append(f"最新清单存在方案外箱：{', '.join(extra)}")
+        raise BusinessError(
+            "当前已确认方案箱项与最新箱清单不一致（" + "；".join(problems) + "）",
+            500,
+        )
+
+    slots, containers, adjacency, incompat = _to_solver_inputs(slot_rev, manifest_rev)
+    original = {i.container_no: i.slot_code for i in plan.items}
+    blocked = tuple(sorted(set(payload.blocked_slots)))
+
+    try:
+        result = solve_restow(
+            containers, slots, adjacency, incompat,
+            slot_rev.min_moment, slot_rev.max_moment,
+            original=original, blocked=blocked,
+        )
+    except InfeasibleStowage as exc:
+        raise BusinessError(f"无完整可行改配：{exc.reason}", 422)
+
+    # 求解完成后快照结果并结束只读事务；在独立连接的写锁内复核后落库
+    parent_id = plan.id
+    root_id = plan.root_id
+    parent_rev = plan.revision_no
+    base_slots_rev = latest_slots
+    base_manifest_rev = latest_manifest
+    original_items = tuple(
+        (i.container_no, i.slot_code, i.stack, i.tier)
+        for i in sorted(plan.items, key=lambda x: x.container_no)
+    )
+    item_rows = tuple(
+        (a.container_no, a.slot_code, a.stack, a.tier)
+        for a in result.assignments
+    )
+    total_moment = result.total_moment
+    max_tier = result.max_occupied_tier
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 保存前复核：基础方案仍存在且仍为当前已确认修订
+        cursor.execute(
+            "SELECT status, slots_revision, manifest_revision, revision_no, root_id "
+            "FROM plans WHERE id = ?",
+            (parent_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("基础方案在求解期间被删除，应急改配草稿被拒绝且不保存")
+        status_locked, slots_rev_locked, manifest_rev_locked, rev_locked, root_locked = row
+        if status_locked != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现基础方案状态已为 {status_locked}（可能已被新修订取代），"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+        if slots_rev_locked != base_slots_rev or manifest_rev_locked != base_manifest_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现基础方案所用资料已变化（槽位资料修订 "
+                f"{slots_rev_locked}、箱清单修订 {manifest_rev_locked}），"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+
+        # 同根出现更新修订（新草稿/新确认）-> 拒绝，由调用方基于最新修订重试
+        cursor.execute(
+            "SELECT id FROM plans WHERE root_id = ? AND revision_no > ? LIMIT 1",
+            (root_locked, rev_locked),
+        )
+        if cursor.fetchone() is not None:
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现同方案链（root={root_locked}）已出现更新修订，"
+                "应急改配草稿被拒绝且不保存，原确认方案仍有效"
+            )
+
+        # 资料在求解期间是否产生新修订
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM slot_revisions")
+        if cursor.fetchone()[0] != base_slots_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现槽位资料已产生新修订，应急改配草稿被拒绝且不保存，"
+                "原确认方案仍有效"
+            )
+        cursor.execute("SELECT COALESCE(MAX(revision), 0) FROM manifest_revisions")
+        if cursor.fetchone()[0] != base_manifest_rev:
+            conn.rollback()
+            raise ConflictError(
+                "保存前复核发现箱清单已产生新修订，应急改配草稿被拒绝且不保存，"
+                "原确认方案仍有效"
+            )
+
+        new_id = models._new_id()
+        new_revision_no = parent_rev + 1
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        # 草稿不写 confirmed_slots，不影响原确认方案的槽位占用
+        cursor.execute(
+            "INSERT INTO plans "
+            "(id, revision_no, status, slots_revision, manifest_revision, "
+            "total_moment, max_tier, created_at, confirmed_at, parent_id, root_id) "
+            "VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (new_id, new_revision_no, base_slots_rev, base_manifest_rev,
+             total_moment, max_tier, now, parent_id, root_id),
+        )
+        cursor.executemany(
+            "INSERT INTO plan_items (plan_id, container_no, slot_code, stack, tier) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(new_id, *r4) for r4 in item_rows],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    new_plan = get_plan(db, new_id)
+
+    orig_by_no = {cno: (scode, stack, tier) for cno, scode, stack, tier in original_items}
+    moves = []
+    for item in sorted(new_plan.items, key=lambda x: x.container_no):
+        from_code, from_stack, from_tier = orig_by_no[item.container_no]
+        if from_code != item.slot_code:
+            moves.append({
+                "container_no": item.container_no,
+                "from_slot_code": from_code,
+                "to_slot_code": item.slot_code,
+                "from_stack": from_stack,
+                "to_stack": item.stack,
+                "from_tier": from_tier,
+                "to_tier": item.tier,
+            })
+
+    return {
+        "plan": new_plan,
+        "blocked_slots": list(blocked),
+        "moves": moves,
+    }
+
+
+# ---------- 装船时间表 ----------
+
+
+def create_loading_schedule(
+    db: Session,
+    plan_id: str,
+    payload: ScheduleCreateIn,
+) -> models.LoadingSchedule:
+    """为已确认方案修订求解并保存装船时间表。
+
+    箱项缺失或多余、时间窗无解、求解不可行均拒绝且不保存；
+    保存前在 IMMEDIATE 写锁内再次核对方案仍为已确认状态。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可生成装船时间表"
+        )
+
+    # 箱项必须与方案修订完全一致（不多不少）
+    plan_items = {i.container_no: i for i in plan.items}
+    submitted = {e.no: e for e in payload.entries}
+    missing = sorted(set(plan_items) - set(submitted))
+    extra = sorted(set(submitted) - set(plan_items))
+    if missing or extra:
+        problems = []
+        if missing:
+            problems.append(f"缺少箱项：{', '.join(missing)}")
+        if extra:
+            problems.append(f"多余箱项：{', '.join(extra)}")
+        raise BusinessError(
+            "提交箱项与方案修订不一致（" + "；".join(problems) + "），拒绝排程",
+            422,
+        )
+
+    jobs = [
+        Job(
+            no=no,
+            stack=plan_items[no].stack,
+            stack_tier=plan_items[no].tier,
+            duration=e.duration,
+            release=e.release_minute,
+            deadline=e.deadline_minute,
+        )
+        for no, e in submitted.items()
+    ]
+    try:
+        result = solve_loading(jobs, payload.crane_count)
+    except InfeasibleSchedule as exc:
+        raise BusinessError(f"无解：{exc.reason}", 422)
+
+    # 求解完成后快照结果，结束只读事务；在独立连接的写锁内复核方案状态后落库
+    snapshot = tuple(
+        (
+            sc.container_no,
+            plan_items[sc.container_no].stack,
+            plan_items[sc.container_no].tier,
+            sc.start_minute,
+            sc.finish_minute,
+            sc.crane_no,
+        )
+        for sc in result.jobs
+    )
+    crane_count = payload.crane_count
+    makespan = result.makespan
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT status FROM plans WHERE id = ?", (plan_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在排程保存期间被删除，排程被拒绝且不保存")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（方案可能已被新修订取代），"
+                "本次排程被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：以新排程原子替换旧排程
+        cursor.execute(
+            "SELECT id FROM loading_schedules WHERE plan_id = ?", (plan_id,)
+        )
+        old = cursor.fetchone()
+        if old is not None:
+            cursor.execute(
+                "DELETE FROM loading_schedule_items WHERE schedule_id = ?",
+                (old[0],),
+            )
+            cursor.execute("DELETE FROM loading_schedules WHERE id = ?", (old[0],))
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO loading_schedules "
+            "(plan_id, crane_count, makespan, status, created_at) "
+            "VALUES (?, ?, ?, 'current', ?)",
+            (plan_id, crane_count, makespan, now),
+        )
+        schedule_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO loading_schedule_items "
+            "(schedule_id, container_no, stack, tier, start_minute, "
+            "finish_minute, crane_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(schedule_id, *row7) for row7 in snapshot],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_loading_schedule(db, plan_id)
+
+
+def list_loading_schedules(
+    db: Session, include_historical: bool = False
+) -> list[models.LoadingSchedule]:
+    stmt = select(models.LoadingSchedule)
+    if not include_historical:
+        stmt = stmt.where(models.LoadingSchedule.status == "current")
+    stmt = stmt.order_by(models.LoadingSchedule.id)
+    return list(db.scalars(stmt))
+
+
+def get_loading_schedule(db: Session, plan_id: str) -> models.LoadingSchedule:
+    schedule = db.scalar(
+        select(models.LoadingSchedule).where(
+            models.LoadingSchedule.plan_id == plan_id
+        )
+    )
+    if schedule is None:
+        raise BusinessError(f"方案 {plan_id} 不存在装船时间表", 404)
+    return schedule
+
+
+# ---------- 逐港卸箱顺序 ----------
+
+
+def _placed_containers(db: Session, plan: models.Plan):
+    """按方案修订所用箱重（箱清单修订）与槽位力臂（槽位资料修订）组装箱快照。"""
+    manifest_rev = get_manifest_revision(db, plan.manifest_revision)
+    slot_rev = get_slot_revision(db, plan.slots_revision)
+    container_by_no = {c.no: c for c in manifest_rev.containers}
+    slot_by_code = {s.code: s for s in slot_rev.slots}
+
+    placed = []
+    for item in plan.items:
+        crow = container_by_no.get(item.container_no)
+        if crow is None:
+            raise BusinessError(
+                f"方案箱 {item.container_no} 在箱清单修订 "
+                f"{plan.manifest_revision} 中缺失，数据不一致", 500
+            )
+        srow = slot_by_code.get(item.slot_code)
+        if srow is None:
+            raise BusinessError(
+                f"方案槽位 {item.slot_code} 在槽位资料修订 "
+                f"{plan.slots_revision} 中缺失，数据不一致", 500
+            )
+        placed.append(
+            PlacedContainer(
+                no=item.container_no,
+                weight=crow.weight,
+                arm=srow.arm,
+                stack=item.stack,
+                tier=item.tier,
+                discharge_order=crow.discharge_order,
+            )
+        )
+    return placed
+
+
+def create_unloading_sequence(
+    db: Session,
+    plan_id: str,
+    payload: UnloadingCreateIn,
+) -> models.UnloadingSequence:
+    """为已确认方案修订求解并保存逐港卸箱顺序。
+
+    卸港序号与方案箱清单不一致、区间倒置、无可行顺序、求解无法确定均拒绝且不保存；
+    保存前在 IMMEDIATE 写锁内再次核对方案仍为已确认状态。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可规划逐港卸箱顺序"
+        )
+
+    boxes = _placed_containers(db, plan)
+    slot_by_item = {i.container_no: i.slot_code for i in plan.items}
+
+    windows = [
+        PortWindow(
+            discharge_order=p.discharge_order,
+            min_remaining_moment=p.min_remaining_moment,
+            max_remaining_moment=p.max_remaining_moment,
+        )
+        for p in payload.ports
+    ]
+
+    try:
+        result = solve_unloading(boxes, windows)
+    except InfeasibleUnloading as exc:
+        # 入参一致性问题、无可行顺序、求解无法确定均归 422 且不保存
+        raise BusinessError(f"无可行卸箱顺序：{exc.reason}", 422)
+
+    # 求解完成后快照结果，结束只读事务；在独立连接的写锁内复核方案状态后落库
+    step_rows = tuple(
+        (
+            st.step_no,
+            st.discharge_order,
+            st.container_no,
+            slot_by_item[st.container_no],
+            st.stack,
+            st.tier,
+            st.weight,
+            st.arm,
+            st.remaining_moment,
+        )
+        for st in result.steps
+    )
+    port_rows = tuple(
+        sorted(
+            ((w.discharge_order, w.min_remaining_moment, w.max_remaining_moment)
+             for w in windows),
+            key=lambda r: r[0],
+        )
+    )
+    initial_moment = result.initial_moment
+    final_moment = result.final_moment
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在卸箱顺序保存期间被删除，顺序被拒绝且不保存")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（方案可能已被新修订取代），"
+                "本次卸箱顺序被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：以新顺序原子替换旧顺序
+        cursor.execute(
+            "SELECT id FROM unloading_sequences WHERE plan_id = ?", (plan_id,)
+        )
+        old = cursor.fetchone()
+        if old is not None:
+            cursor.execute(
+                "DELETE FROM unloading_steps WHERE sequence_id = ?", (old[0],)
+            )
+            cursor.execute(
+                "DELETE FROM unloading_ports WHERE sequence_id = ?", (old[0],)
+            )
+            cursor.execute(
+                "DELETE FROM unloading_sequences WHERE id = ?", (old[0],)
+            )
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO unloading_sequences "
+            "(plan_id, initial_moment, final_moment, status, created_at) "
+            "VALUES (?, ?, ?, 'current', ?)",
+            (plan_id, initial_moment, final_moment, now),
+        )
+        sequence_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO unloading_ports "
+            "(sequence_id, discharge_order, min_remaining_moment, "
+            "max_remaining_moment) VALUES (?, ?, ?, ?)",
+            [(sequence_id, *row3) for row3 in port_rows],
+        )
+        cursor.executemany(
+            "INSERT INTO unloading_steps "
+            "(sequence_id, step_no, discharge_order, container_no, slot_code, "
+            "stack, tier, weight, arm, remaining_moment) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(sequence_id, *row9) for row9 in step_rows],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_unloading_sequence(db, plan_id)
+
+
+def list_unloading_sequences(
+    db: Session, include_historical: bool = False
+) -> list[models.UnloadingSequence]:
+    stmt = select(models.UnloadingSequence)
+    if not include_historical:
+        stmt = stmt.where(models.UnloadingSequence.status == "current")
+    stmt = stmt.order_by(models.UnloadingSequence.id)
+    return list(db.scalars(stmt))
+
+
+def get_unloading_sequence(db: Session, plan_id: str) -> models.UnloadingSequence:
+    sequence = db.scalar(
+        select(models.UnloadingSequence).where(
+            models.UnloadingSequence.plan_id == plan_id
+        )
+    )
+    if sequence is None:
+        raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序", 404)
+    return sequence
+
+
+# ---------- 装船实绩登记（事件重放） ----------
+
+
+def _load_actuals_view(db: Session, plan_id: str) -> models.LoadingActuals:
+    actuals = db.scalar(
+        select(models.LoadingActuals).where(models.LoadingActuals.plan_id == plan_id)
+    )
+    if actuals is None:
+        raise BusinessError(f"方案 {plan_id} 尚无装船实绩登记", 404)
+    return actuals
+
+
+def register_actual_events(
+    db: Session,
+    plan_id: str,
+    payload: ActualEventRegisterIn,
+) -> tuple[models.LoadingActuals, bool]:
+    """登记逐箱实际开工/完工事件，返回 (实缋头, 是否为纯重试幂等命中)。
+
+    首次登记时在写锁内原子冻结当时排程作为偏差基线；后续排程替换不影响已登记
+    实绩与基线。方案被新修订取代后实绩只读（409）。事件允许晚到：合并全部已
+    登记事件按实际分钟重放（同分钟完工先于开工）；任一事件使重放链非法则整次
+    拒绝、记录不变（422）。同方案内流水号同内容重试返回原结果，异内容冲突（409）。
+    """
+    plan = get_plan(db, plan_id)
+    plan_nos = {i.container_no for i in plan.items}
+
+    # 锁前快速预检（锁内还会再次核对）：箱必须属于方案
+    for e in payload.events:
+        if e.container_no not in plan_nos:
+            raise BusinessError(
+                f"箱 {e.container_no} 不在方案 {plan_id} 中，拒绝登记实绩",
+                422,
+            )
+
+    incoming = tuple(
+        (e.seq, e.event_type, e.container_no, e.crane_no, e.minute)
+        for e in payload.events
+    )
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 锁内复核方案状态：方案被新修订取代后实绩只读
+        cursor.execute(
+            "SELECT status FROM plans WHERE id = ?", (plan_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked = row[0]
+        if plan_status_locked == "draft":
+            conn.rollback()
+            raise ConflictError(
+                "方案尚未确认（draft），无已确认装船排程，拒绝登记装船实绩"
+            )
+        if plan_status_locked == "superseded":
+            conn.rollback()
+            raise ConflictError(
+                "方案修订已被新修订取代，其装船实绩已冻结为只读，不再接受登记"
+            )
+
+        cursor.execute(
+            "SELECT id, baseline_crane_count FROM loading_actuals WHERE plan_id = ?",
+            (plan_id,),
+        )
+        head = cursor.fetchone()
+
+        if head is None:
+            # 首次登记：原子绑定并冻结当时排程作为偏差基线
+            cursor.execute(
+                "SELECT id, crane_count FROM loading_schedules "
+                "WHERE plan_id = ? AND status = 'current'",
+                (plan_id,),
+            )
+            sch = cursor.fetchone()
+            if sch is None:
+                conn.rollback()
+                raise ConflictError(
+                    f"方案 {plan_id} 没有当前装船排程，须先生成并确认装船时间表，"
+                    "方可登记装船实绩"
+                )
+            schedule_id, crane_count = sch
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor.execute(
+                "INSERT INTO loading_actuals "
+                "(plan_id, baseline_crane_count, baseline_schedule_id, "
+                "baseline_frozen_at, version, created_at) "
+                "VALUES (?, ?, ?, ?, 1, ?)",
+                (plan_id, crane_count, schedule_id, now, now),
+            )
+            actuals_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO loading_actual_baseline_items "
+                "(actuals_id, container_no, stack, tier, start_minute, "
+                "finish_minute, crane_no) "
+                "SELECT ?, container_no, stack, tier, start_minute, finish_minute, "
+                "crane_no FROM loading_schedule_items "
+                "WHERE schedule_id = ?",
+                (actuals_id, schedule_id),
+            )
+        else:
+            actuals_id, crane_count = head
+
+        # 已登记事件（seq -> 内容），用于幂等与冲突判定。
+        # 原登记接口始终按**首次登记内容**识别同流水号重试与冲突：事件类型与箱号
+        # 不可更正（现行值即原始值），分钟/岸桥取 orig_* 原始列，不受更正影响。
+        cursor.execute(
+            "SELECT seq, event_type, container_no, orig_crane_no, orig_minute, id, "
+            "crane_no, minute "
+            "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
+            (actuals_id,),
+        )
+        existing_rows = cursor.fetchall()
+        existing_by_seq = {r[0]: r for r in existing_rows}
+
+        new_rows: list[tuple] = []
+        for seq, etype, cno, crane_no, minute in incoming:
+            old = existing_by_seq.get(seq)
+            if old is not None:
+                # r[1..4] = 首次登记的原始 类型/箱/桥/分钟
+                if (old[1], old[2], old[3], old[4]) == (etype, cno, crane_no, minute):
+                    continue  # 同流水号同原始内容：重试，原结果幂等返回（不改写更正）
+                conn.rollback()
+                raise ConflictError(
+                    f"事件流水号 {seq} 已登记且内容不同（首次登记："
+                    f"{old[1]} 箱 {old[2]} 桥 {old[3]} 第 {old[4]} 分钟），"
+                    "异内容冲突，本次登记被拒绝且记录不变；如需修正分钟或岸桥，"
+                    "请调用实绩更正接口"
+                )
+            if crane_no > crane_count:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：岸桥编号 {crane_no} 超出冻结排程岸桥数量 "
+                    f"{crane_count}（合法编号 1..{crane_count}），拒绝登记",
+                    422,
+                )
+            new_rows.append((seq, etype, cno, crane_no, minute))
+
+        if not new_rows:
+            # 全部为同内容重试：不写入，直接返回原结果
+            idempotent_hit = True
+            conn.commit()
+        else:
+            # 合并旧事件与新事件，按实际分钟重放（同分钟完工先于开工）。
+            # 重放使用各事件**当前生效**的 minute/crane_no（r[8]/r[9]）；
+            # 新事件尚未落库、无自增 id：同分钟同类型时以已落库事件优先，
+            # 新事件之间按本次提交顺序排（以自增序占位保证排在既有事件之后）。
+            events: list[ActualEvent] = [
+                ActualEvent(
+                    seq=r[0], event_type=r[1], container_no=r[2],
+                    crane_no=r[6], minute=r[7], arrival_id=r[5],
+                )
+                for r in existing_rows
+            ]
+            next_arrival = max((r[5] for r in existing_rows), default=0)
+            for offset, (seq, etype, cno, crane_no, minute) in enumerate(new_rows, start=1):
+                events.append(ActualEvent(
+                    seq=seq, event_type=etype, container_no=cno,
+                    crane_no=crane_no, minute=minute,
+                    arrival_id=next_arrival + offset,
+                ))
+
+            cursor.execute(
+                "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+                (plan_id,),
+            )
+            plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+            try:
+                replay_actuals(events, plan_items, crane_count)
+            except ActualsReplayError as exc:
+                conn.rollback()
+                raise BusinessError(f"实绩事件重放被拒绝：{exc.reason}", 422)
+
+            cursor.executemany(
+                "INSERT INTO loading_actual_events "
+                "(actuals_id, seq, event_type, container_no, crane_no, minute, "
+                "orig_minute, orig_crane_no, corrected, registered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                [
+                    (actuals_id, seq, etype, cno, crane_no, minute,
+                     minute, crane_no,
+                     models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
+                    for seq, etype, cno, crane_no, minute in new_rows
+                ],
+            )
+            conn.commit()
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return _load_actuals_view(db, plan_id), idempotent_hit
+
+
+def correct_actual_event(
+    db: Session,
+    plan_id: str,
+    payload: ActualEventCorrectionIn,
+) -> tuple[dict, bool]:
+    """更正一条已登记实绩事件的分钟或岸桥，返回 (ActualsOut 字典, 是否幂等重试)。
+
+    凭方案编号、原事件流水号、期望实绩版本、更正请求号与替代的完整事件内容更正；
+    替代事件沿用原流水号、事件类型与箱号，只改 minute 或 crane_no。更正后按现有
+    规则重放全部有效事件：整条链非法则整次拒绝，实绩、版本与更正历史均不变（422）。
+    成功则 version+1 并留档原值与更正历史（201）。同 request_id 同内容重试，即使
+    版本已被后续更正推进，也返回首次更正的结果快照、不重复生效（200）；同 request_id
+    异内容或期望版本过期返回 409。方案被取代（只读）或原事件不存在分别返回 409/404。
+    """
+    plan = get_plan(db, plan_id)
+    plan_nos = {i.container_no for i in plan.items}
+
+    seq = payload.seq
+    expected_version = payload.expected_version
+    request_id = payload.request_id
+    repl = payload.event
+    # 锁前快速预检（锁内还会再次核对）：替代箱仍须属于方案
+    if repl.container_no not in plan_nos:
+        raise BusinessError(
+            f"箱 {repl.container_no} 不在方案 {plan_id} 中，拒绝更正实绩事件",
+            422,
+        )
+
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 锁内复核方案状态
+        cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked = prow[0]
+        if plan_status_locked == "draft":
+            conn.rollback()
+            raise ConflictError("方案尚未确认（draft），尚无装船实绩可更正")
+        if plan_status_locked == "superseded":
+            conn.rollback()
+            raise ConflictError(
+                "方案修订已被新修订取代，其装船实绩已冻结为只读，不再接受更正"
+            )
+
+        cursor.execute(
+            "SELECT id, version, baseline_crane_count FROM loading_actuals "
+            "WHERE plan_id = ?",
+            (plan_id,),
+        )
+        head = cursor.fetchone()
+        if head is None:
+            conn.rollback()
+            raise BusinessError(
+                f"方案 {plan_id} 尚无装船实绩登记，原事件流水号 {seq} 未找到", 404
+            )
+        actuals_id, current_version, crane_count = head
+
+        # 幂等：同方案内 request_id 唯一。先查该请求号是否已生效过。
+        # 以请求号为幂等键：若整次请求（期望版本/流水号/替代内容）与首次提交完全
+        # 一致，则无论版本后来是否被其它更正推进，都返回首次更正的结果快照。
+        cursor.execute(
+            "SELECT response_snapshot, seq, expected_version, event_type, container_no, "
+            "new_minute, new_crane_no FROM loading_actual_corrections "
+            "WHERE actuals_id = ? AND request_id = ?",
+            (actuals_id, request_id),
+        )
+        snap_row = cursor.fetchone()
+
+        # 原事件（目标流水号）
+        cursor.execute(
+            "SELECT seq, event_type, container_no, crane_no, minute, id "
+            "FROM loading_actual_events WHERE actuals_id = ? AND seq = ?",
+            (actuals_id, seq),
+        )
+        target = cursor.fetchone()
+        if target is None:
+            conn.rollback()
+            raise BusinessError(
+                f"原事件流水号 {seq} 未找到（方案 {plan_id} 未登记该流水号），"
+                "无法更正",
+                404,
+            )
+        t_seq, t_type, t_cno, t_crane, t_minute, t_id = target
+
+        if snap_row is not None:
+            (snapshot_json, s_seq, s_expected, s_type, s_cno,
+             s_new_minute, s_new_crane) = snap_row
+            same_request = (
+                seq == s_seq
+                and expected_version == s_expected
+                and repl.event_type == s_type
+                and repl.container_no == s_cno
+                and repl.minute == s_new_minute
+                and repl.crane_no == s_new_crane
+            )
+            if same_request:
+                # 同请求号同内容重试 -> 返回首次更正结果快照，不重复生效
+                idempotent_hit = True
+                conn.commit()
+                return json.loads(snapshot_json), idempotent_hit
+            conn.rollback()
+            raise ConflictError(
+                f"更正请求号 {request_id} 已用于一次不同内容的更正，"
+                "同请求号不得提交异内容（如需再次更正请使用新的更正请求号），"
+                "本次更正被拒绝且记录不变"
+            )
+
+        # 全新请求号：先做期望版本（乐观并发）校验
+        if expected_version != current_version:
+            conn.rollback()
+            raise ConflictError(
+                f"期望实绩版本 {expected_version} 已过期：当前版本为 "
+                f"{current_version}，请基于最新实绩重新提交更正，本次更正被拒绝"
+                "且记录不变"
+            )
+
+        # 替代事件只能沿用原流水号、类型与箱号，只改分钟或岸桥
+        if repl.event_type != t_type:
+            conn.rollback()
+            raise BusinessError(
+                f"替代事件类型 {repl.event_type} 与原事件类型 {t_type} 不一致："
+                "更正沿用原事件类型，只允许修改分钟或岸桥",
+                422,
+            )
+        if repl.container_no != t_cno:
+            conn.rollback()
+            raise BusinessError(
+                f"替代事件箱号 {repl.container_no} 与原箱号 {t_cno} 不一致："
+                "更正沿用原箱号，只允许修改分钟或岸桥",
+                422,
+            )
+        if repl.crane_no == t_crane and repl.minute == t_minute:
+            conn.rollback()
+            raise BusinessError(
+                f"更正请求号 {request_id}：替代事件与原事件（桥 {t_crane}、"
+                f"第 {t_minute} 分钟）完全相同，未修改分钟或岸桥，拒绝空更正",
+                422,
+            )
+
+        # 用替代值重放全部有效事件（沿用原到达 id，保持到达先后）
+        cursor.execute(
+            "SELECT seq, event_type, container_no, crane_no, minute, id "
+            "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
+            (actuals_id,),
+        )
+        all_rows = cursor.fetchall()
+        events = []
+        for r in all_rows:
+            if r[0] == seq:
+                events.append(ActualEvent(
+                    seq=t_seq, event_type=t_type, container_no=t_cno,
+                    crane_no=repl.crane_no, minute=repl.minute, arrival_id=r[5],
+                ))
+            else:
+                events.append(ActualEvent(
+                    seq=r[0], event_type=r[1], container_no=r[2],
+                    crane_no=r[3], minute=r[4], arrival_id=r[5],
+                ))
+        cursor.execute(
+            "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+            (plan_id,),
+        )
+        plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+        try:
+            replay_result = replay_actuals(events, plan_items, crane_count)
+        except ActualsReplayError as exc:
+            conn.rollback()
+            raise BusinessError(
+                f"更正后实绩重放链非法：{exc.reason}；整次更正被拒绝，"
+                "实绩、版本与更正历史均不变",
+                422,
+            )
+
+        # 合法：原子更新目标事件现行值、版本 +1，并写更正历史
+        new_version = current_version + 1
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "UPDATE loading_actual_events SET crane_no = ?, minute = ?, corrected = 1 "
+            "WHERE id = ?",
+            (repl.crane_no, repl.minute, t_id),
+        )
+        # 先插入更正历史（snapshot 在同事务内组装后回填），以拿到自增 id
+        cursor.execute(
+            "INSERT INTO loading_actual_corrections "
+            "(actuals_id, request_id, seq, expected_version, from_version, to_version, "
+            "event_type, container_no, old_minute, new_minute, old_crane_no, "
+            "new_crane_no, response_snapshot, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)",
+            (actuals_id, request_id, seq, expected_version, current_version,
+             new_version, t_type, t_cno, t_minute, repl.minute, t_crane,
+             repl.crane_no, now),
+        )
+        correction_id = cursor.lastrowid
+        cursor.execute(
+            "UPDATE loading_actuals SET version = ? WHERE id = ?",
+            (new_version, actuals_id),
+        )
+
+        # ---- 在同一事务/快照下组装首次更正结果（与 GET /actuals 严格一致）----
+        cursor.execute(
+            "SELECT revision_no FROM plans WHERE id = ?", (plan_id,)
+        )
+        revision_no = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT baseline_frozen_at, created_at FROM loading_actuals WHERE id = ?",
+            (actuals_id,),
+        )
+        bf, ca = cursor.fetchone()
+        cursor.execute(
+            "SELECT container_no, stack, tier, start_minute, finish_minute, crane_no "
+            "FROM loading_actual_baseline_items WHERE actuals_id = ?",
+            (actuals_id,),
+        )
+        baseline_rows = list(cursor.fetchall())
+        cursor.execute(
+            "SELECT seq, event_type, container_no, crane_no, minute, orig_crane_no, "
+            "orig_minute, corrected, registered_at "
+            "FROM loading_actual_events WHERE actuals_id = ? ORDER BY seq",
+            (actuals_id,),
+        )
+        event_rows = []
+        for r in cursor.fetchall():
+            event_rows.append((
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], bool(r[7]),
+                utc_iso(_raw_dt(r[8])),
+            ))
+        cursor.execute(
+            "SELECT id, request_id, seq, expected_version, from_version, to_version, "
+            "event_type, container_no, old_minute, new_minute, old_crane_no, "
+            "new_crane_no, created_at FROM loading_actual_corrections "
+            "WHERE actuals_id = ? ORDER BY id",
+            (actuals_id,),
+        )
+        correction_rows = []
+        for r in cursor.fetchall():
+            correction_rows.append((
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+                r[10], r[11], utc_iso(_raw_dt(r[12])),
+            ))
+
+        out = assemble_actuals_out(
+            plan_id=plan_id,
+            revision_no=revision_no,
+            version=new_version,
+            plan_status=plan_status_locked,
+            baseline_frozen_at=utc_iso(_raw_dt(bf)),
+            baseline_crane_count=crane_count,
+            created_at=utc_iso(_raw_dt(ca)),
+            replay_result=replay_result,
+            baseline_rows=baseline_rows,
+            event_rows=event_rows,
+            correction_rows=correction_rows,
+        )
+        # 回填幂等快照（含本次更正，version=新值）
+        cursor.execute(
+            "UPDATE loading_actual_corrections SET response_snapshot = ? WHERE id = ?",
+            (json.dumps(out, ensure_ascii=False), correction_id),
+        )
+        conn.commit()
+        return out, idempotent_hit
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _raw_dt(value):
+    """裸游标读出的时间列归一化为 datetime（SQLite 驱动通常直接返回 datetime）。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.rstrip()
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return value
+
+
+def get_actuals(db: Session, plan_id: str) -> models.LoadingActuals:
+    # 方案须存在（不存在给 404 方案错误），实绩头不存在给 404 实绩错误
+    get_plan(db, plan_id)
+    return _load_actuals_view(db, plan_id)
+
+
+def build_actuals_out(db: Session, actuals: models.LoadingActuals) -> dict:
+    """重放已登记事件，组装每箱状态、实际起止、相对冻结基线的偏差与未完箱。"""
+    events = [
+        ActualEvent(
+            seq=e.seq, event_type=e.event_type, container_no=e.container_no,
+            crane_no=e.crane_no, minute=e.minute, arrival_id=e.id,
+        )
+        for e in sorted(actuals.events, key=lambda x: x.id)
+    ]
+    plan_items = [(i.container_no, i.stack, i.tier) for i in actuals.plan.items]
+    # 已落库事件必然通过重放校验（防御性仍调用以得到状态）
+    result = replay_actuals(events, plan_items, actuals.baseline_crane_count)
+    baseline_rows = [
+        (b.container_no, b.stack, b.tier, b.start_minute, b.finish_minute, b.crane_no)
+        for b in sorted(actuals.baseline_items, key=lambda x: x.container_no)
+    ]
+    event_rows = [
+        (e.seq, e.event_type, e.container_no, e.crane_no, e.minute,
+         e.orig_crane_no, e.orig_minute, bool(e.corrected),
+         utc_iso(e.registered_at))
+        for e in sorted(actuals.events, key=lambda x: x.seq)
+    ]
+    correction_rows = [
+        (c.id, c.request_id, c.seq, c.expected_version, c.from_version, c.to_version,
+         c.event_type, c.container_no, c.old_minute, c.new_minute,
+         c.old_crane_no, c.new_crane_no, utc_iso(c.created_at))
+        for c in sorted(actuals.corrections, key=lambda x: x.id)
+    ]
+    return assemble_actuals_out(
+        plan_id=actuals.plan_id,
+        revision_no=actuals.plan.revision_no,
+        version=actuals.version,
+        plan_status=actuals.plan.status,
+        baseline_frozen_at=utc_iso(actuals.baseline_frozen_at),
+        baseline_crane_count=actuals.baseline_crane_count,
+        created_at=utc_iso(actuals.created_at),
+        replay_result=result,
+        baseline_rows=baseline_rows,
+        event_rows=event_rows,
+        correction_rows=correction_rows,
+    )
+
+
+def assemble_actuals_out(
+    *,
+    plan_id: str,
+    revision_no: int,
+    version: int,
+    plan_status: str,
+    baseline_frozen_at: str,
+    baseline_crane_count: int,
+    created_at: str,
+    replay_result: dict,
+    # (container_no, stack, tier, start, finish, crane)
+    baseline_rows,
+    # (seq, type, cno, crane, minute, orig_crane, orig_minute, corrected, registered_at)
+    event_rows,
+    # (id, request_id, seq, expected, from_v, to_v, type, cno, old_min, new_min,
+    #  old_crane, new_crane, created_at)
+    correction_rows,
+) -> dict:
+    """纯组装：输入重放结果与各表行元组，产出 ActualsOut 字典。
+
+    ORM 路径与更正写锁内的裸游标路径共用，保证幂等快照与查询呈现严格一致。
+    """
+    boxes = replay_result["boxes"]
+    baseline_by_no = {row[0]: row for row in baseline_rows}
+
+    containers = []
+    for no in sorted(boxes):
+        box = boxes[no]
+        base = baseline_by_no.get(no)
+        # base: (cno, stack, tier, start, finish, crane)
+        containers.append({
+            "container_no": no,
+            "status": box.status,
+            "actual_start_minute": box.start_minute,
+            "actual_finish_minute": box.finish_minute,
+            "actual_crane_no": box.crane_no,
+            "baseline_start_minute": base[3] if base else None,
+            "baseline_finish_minute": base[4] if base else None,
+            "baseline_crane_no": base[5] if base else None,
+            "start_delta_minutes": (
+                box.start_minute - base[3]
+                if box.start_minute is not None and base is not None else None
+            ),
+            "finish_delta_minutes": (
+                box.finish_minute - base[4]
+                if box.finish_minute is not None and base is not None else None
+            ),
+            "crane_changed": (
+                box.crane_no != base[5]
+                if box.crane_no is not None and base is not None else None
+            ),
+            "stack": box.stack,
+            "tier": box.tier,
+        })
+
+    return {
+        "plan_id": plan_id,
+        "revision_no": revision_no,
+        "version": version,
+        "plan_status": plan_status,
+        "read_only": plan_status == "superseded",
+        "baseline_frozen_at": baseline_frozen_at,
+        "baseline_crane_count": baseline_crane_count,
+        "baseline": [
+            {
+                "container_no": r[0],
+                "start_minute": r[3],
+                "finish_minute": r[4],
+                "crane_no": r[5],
+                "stack": r[1],
+                "tier": r[2],
+            }
+            for r in baseline_rows
+        ],
+        "containers": containers,
+        "unfinished_containers": replay_result["unfinished"],
+        "replay_order": replay_result["order"],
+        "events": [
+            {
+                "seq": r[0],
+                "event_type": r[1],
+                "container_no": r[2],
+                "crane_no": r[3],
+                "minute": r[4],
+                "orig_crane_no": r[5],
+                "orig_minute": r[6],
+                "corrected": bool(r[7]),
+                "registered_at": r[8],
+            }
+            for r in sorted(event_rows, key=lambda x: x[0])
+        ],
+        "corrections": [
+            {
+                "request_id": r[1],
+                "seq": r[2],
+                "expected_version": r[3],
+                "from_version": r[4],
+                "to_version": r[5],
+                "event_type": r[6],
+                "container_no": r[7],
+                "old_minute": r[8],
+                "new_minute": r[9],
+                "old_crane_no": r[10],
+                "new_crane_no": r[11],
+                "created_at": r[12],
+            }
+            for r in sorted(correction_rows, key=lambda x: x[0])
+        ],
+        "created_at": created_at,
+    }
+
+
+def utc_iso(dt) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc).isoformat()
