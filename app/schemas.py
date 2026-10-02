@@ -532,6 +532,105 @@ class ActualsOut(BaseModel):
     created_at: str
 
 
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+class HandoverCreateIn(BaseModel):
+    """装船完结交接申请：按已确认方案为全部已登记完工业绩申请不可变凭证。"""
+
+    handover_no: str = Field(
+        ..., description="交接号（非空，幂等键）：同号同内容重试返回原凭证，同号异内容冲突"
+    )
+    cutoff_minute: int = Field(
+        ..., ge=0, description="截止分钟（非负整数）；每箱均须在截止前（含恰在截止分钟）完工，"
+                              "且截止之后不得存在有效事件"
+    )
+    expected_actuals_version: int = Field(
+        ..., ge=1, description="期望实绩版本（正整数）；与当前实绩版本不一致返回 409"
+    )
+    valid_seqs: list[int] = Field(
+        ..., description="有效流水号集合：须与当前全部已登记事件流水号完全一致；"
+                        "不得重复、流水号须为正整数"
+    )
+    max_finish_delay_minutes: int = Field(
+        ..., ge=0, description="允许的最大完工延误分钟（非负整数；0=不得晚于冻结基线完工）"
+    )
+
+    @field_validator("handover_no")
+    @classmethod
+    def _handover_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "交接号")
+
+    @field_validator("valid_seqs")
+    @classmethod
+    def _valid_seqs_positive(cls, v: list[int]) -> list[int]:
+        bad = sorted({s for s in v if not isinstance(s, int) or isinstance(s, bool)
+                      or s < 1})
+        if bad:
+            raise ValueError(
+                f"有效流水号必须均为正整数，非法流水号：{', '.join(map(str, bad))}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _unique_seqs(self) -> "HandoverCreateIn":
+        if len(set(self.valid_seqs)) != len(self.valid_seqs):
+            dup = sorted({s for s in self.valid_seqs if self.valid_seqs.count(s) > 1})
+            raise ValueError(f"有效流水号重复提交：{', '.join(map(str, dup))}")
+        return self
+
+
+class HandoverVoucherContainerOut(BaseModel):
+    container_no: str
+    stack: str
+    tier: int
+    actual_start_minute: int
+    actual_finish_minute: int
+    actual_crane_no: int
+    baseline_start_minute: int
+    baseline_finish_minute: int
+    baseline_crane_no: int
+    start_delta_minutes: int = Field(..., description="实际开工-基线开工（正=延后、负=提前）")
+    finish_delta_minutes: int = Field(..., description="实际完工-基线完工（正=延后、负=提前）")
+    crane_changed: bool
+    finish_delay_minutes: int = Field(
+        ..., description="完工延误 max(实际完工-基线完工, 0)；任一超过阈值即拒绝签发"
+    )
+
+
+class HandoverVoucherOut(BaseModel):
+    voucher_no: str = Field(..., description="凭证号（凭证行 id 的十六进制编号）")
+    handover_no: str
+    plan_id: str
+    revision_no: int = Field(..., description="固化的方案修订号")
+    plan_status: str = Field(
+        ..., description="签发时的方案状态（confirmed）；查询时反映方案当前状态"
+    )
+    cutoff_minute: int
+    expected_actuals_version: int = Field(..., description="申请时提交的期望实绩版本")
+    actuals_version: int = Field(..., description="凭证固化时的实绩版本")
+    current_actuals_version: int | None = Field(
+        None, description="查询时刻的当前实绩版本（签发响应中等于 actuals_version）"
+    )
+    max_finish_delay_minutes: int
+    observed_max_delay_minutes: int = Field(
+        ..., description="本方案各箱完工延误的最大值（凭证固化值）"
+    )
+    container_count: int
+    valid_seqs: list[int] = Field(..., description="固化的有效流水号集合（升序）")
+    actuals_fingerprint: str = Field(..., description="凭证固化时的实绩指纹（SHA-256）")
+    current_actuals_fingerprint: str | None = Field(
+        None, description="查询时刻重算的当前实绩指纹（签发响应中等于 actuals_fingerprint）"
+    )
+    actuals_match: bool = Field(
+        ..., description="凭证是否仍对应当前实绩（指纹与版本均未变）；"
+                        "后续补登/更正后为 false，凭证本身不可变且仍可读"
+    )
+    containers: list[HandoverVoucherContainerOut]
+    summary: str = Field(..., description="摘要：交接号/方案修订/截止分钟/箱数/最大完工延误/实绩版本与指纹")
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

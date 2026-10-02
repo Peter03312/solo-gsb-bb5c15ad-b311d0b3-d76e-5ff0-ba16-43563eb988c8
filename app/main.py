@@ -38,14 +38,20 @@ app = FastAPI(
         "首次登记原子冻结排程基线用于偏差核算，方案被取代后实绩只读），"
         "或按各卸港允许剩余总力矩区间生成全程箱号序列字典序最小的逐港卸箱顺序；"
         "码头临时封锁槽位时，可基于当前已确认方案、最新资料修订生成应急改配草稿"
-        "（先最少换槽箱数，再最低最高占用层，最后箱号升序槽位序列字典序最小）。"
+        "（先最少换槽箱数，再最低最高占用层，最后箱号升序槽位序列字典序最小）；"
+        "全部箱截止前完工后可在装船完结交接时申请不可变交接凭证（固化方案修订、"
+        "各箱实际起止与岸桥、冻结基线、偏差、截止分钟与实绩指纹，同交接号幂等；"
+        "凭证后续实绩变化不改写，查询标示是否仍对应当前实绩，历史凭证仍可读）。"
     ),
 )
 
 
 @app.exception_handler(BusinessError)
 def _business_handler(_request: Request, exc: BusinessError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    content: dict = {"detail": exc.message}
+    if exc.extra:
+        content.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(ConflictError)

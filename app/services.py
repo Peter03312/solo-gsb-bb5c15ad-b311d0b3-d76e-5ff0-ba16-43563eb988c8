@@ -10,9 +10,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.actuals import ActualEvent, ActualsReplayError, replay as replay_actuals
+from app.handovers import actuals_fingerprint, finish_delay
 from app.schemas import (
     ActualEventCorrectionIn,
     ActualEventRegisterIn,
+    HandoverCreateIn,
     ManifestIn,
     PlanConfirmIn,
     RestowCreateIn,
@@ -37,10 +39,12 @@ from app.unloader import (
 
 
 class BusinessError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
+    def __init__(self, message: str, status_code: int = 400, extra: dict | None = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        # 可选的结构化附加字段（如超限箱与偏差），与 detail 一同返回
+        self.extra = extra or {}
 
 
 class ConflictError(Exception):
@@ -1594,3 +1598,588 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+def _handover_summary(
+    *,
+    handover_no: str,
+    revision_no: int,
+    cutoff_minute: int,
+    container_count: int,
+    observed_max_delay: int,
+    max_finish_delay: int,
+    version: int,
+    fingerprint: str,
+) -> str:
+    return (
+        f"装船完结交接 {handover_no}：方案修订 {revision_no}，截止分钟 {cutoff_minute}，"
+        f"共 {container_count} 箱全部截止前完工；最大完工延误 {observed_max_delay} 分钟"
+        f"（允许 {max_finish_delay}）；实绩版本 v{version}，实绩指纹 {fingerprint[:12]}…"
+    )
+
+
+def _voucher_snapshot_from_row(cursor, voucher_row) -> dict:
+    """从凭证行与逐箱行重建签发时快照（GET 时再补当前实绩比对字段）。
+
+    voucher_row 列序：id, handover_no, plan_id, revision_no, cutoff_minute,
+    expected_actuals_version, actuals_version, max_finish_delay_minutes,
+    observed_max_delay_minutes, container_count, actuals_fingerprint,
+    valid_seqs_json, created_at, response_snapshot
+    """
+    (vid, handover_no, plan_id, revision_no, cutoff_minute, expected_version,
+     actuals_version, max_delay, observed_max, container_count, fingerprint,
+     valid_seqs_json, created_at, _response_snapshot) = voucher_row
+    cursor.execute(
+        "SELECT container_no, stack, tier, actual_start_minute, actual_finish_minute, "
+        "actual_crane_no, baseline_start_minute, baseline_finish_minute, "
+        "baseline_crane_no, start_delta_minutes, finish_delta_minutes, crane_changed, "
+        "finish_delay_minutes FROM loading_handover_voucher_items "
+        "WHERE voucher_id = ? ORDER BY container_no",
+        (vid,),
+    )
+    containers = []
+    for r in cursor.fetchall():
+        containers.append({
+            "container_no": r[0],
+            "stack": r[1],
+            "tier": r[2],
+            "actual_start_minute": r[3],
+            "actual_finish_minute": r[4],
+            "actual_crane_no": r[5],
+            "baseline_start_minute": r[6],
+            "baseline_finish_minute": r[7],
+            "baseline_crane_no": r[8],
+            "start_delta_minutes": r[9],
+            "finish_delta_minutes": r[10],
+            "crane_changed": bool(r[11]),
+            "finish_delay_minutes": r[12],
+        })
+    return {
+        "voucher_no": format(vid, "x"),
+        "handover_no": handover_no,
+        "plan_id": plan_id,
+        "revision_no": revision_no,
+        "cutoff_minute": cutoff_minute,
+        "expected_actuals_version": expected_version,
+        "actuals_version": actuals_version,
+        "max_finish_delay_minutes": max_delay,
+        "observed_max_delay_minutes": observed_max,
+        "container_count": container_count,
+        "valid_seqs": json.loads(valid_seqs_json),
+        "actuals_fingerprint": fingerprint,
+        "containers": containers,
+        "created_at": utc_iso(_raw_dt(created_at)),
+        "summary": _handover_summary(
+            handover_no=handover_no, revision_no=revision_no,
+            cutoff_minute=cutoff_minute, container_count=container_count,
+            observed_max_delay=observed_max, max_finish_delay=max_delay,
+            version=actuals_version, fingerprint=fingerprint,
+        ),
+    }
+
+
+def _current_actuals_material(cursor, plan_id: str):
+    """读当前实绩头、基线行与现行事件行；无实绩头返回 None。
+
+    返回 (actuals_id, version, crane_count,
+         [(cno, stack, tier, bstart, bfinish, bcrane)],
+         [(seq, type, cno, crane, minute)])
+    """
+    cursor.execute(
+        "SELECT id, version, baseline_crane_count FROM loading_actuals "
+        "WHERE plan_id = ?",
+        (plan_id,),
+    )
+    head = cursor.fetchone()
+    if head is None:
+        return None
+    actuals_id, version, crane_count = head
+    cursor.execute(
+        "SELECT container_no, stack, tier, start_minute, finish_minute, crane_no "
+        "FROM loading_actual_baseline_items WHERE actuals_id = ?",
+        (actuals_id,),
+    )
+    baseline_rows = [tuple(r) for r in cursor.fetchall()]
+    cursor.execute(
+        "SELECT seq, event_type, container_no, crane_no, minute "
+        "FROM loading_actual_events WHERE actuals_id = ?",
+        (actuals_id,),
+    )
+    event_rows = [tuple(r) for r in cursor.fetchall()]
+    return actuals_id, version, crane_count, baseline_rows, event_rows
+
+
+def _enrich_voucher_snapshot(cursor, snapshot: dict) -> dict:
+    """为凭证快照补上当前实绩比对字段：当前版本/指纹、是否仍匹配、方案当前状态。"""
+    plan_id = snapshot["plan_id"]
+    cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+    prow = cursor.fetchone()
+    plan_status = prow[0] if prow else "missing"
+
+    material = _current_actuals_material(cursor, plan_id)
+    if material is None:
+        current_version = None
+        current_fp = None
+        match = False
+    else:
+        _, current_version, _, baseline_rows, event_rows = material
+        current_fp = actuals_fingerprint(
+            version=current_version,
+            baseline_rows=baseline_rows,
+            event_rows=event_rows,
+        )
+        match = (
+            current_version == snapshot["actuals_version"]
+            and current_fp == snapshot["actuals_fingerprint"]
+        )
+
+    snapshot = dict(snapshot)
+    snapshot["plan_status"] = plan_status
+    snapshot["current_actuals_version"] = current_version
+    snapshot["current_actuals_fingerprint"] = current_fp
+    snapshot["actuals_match"] = match
+    return snapshot
+
+
+def issue_handover_voucher(
+    db: Session,
+    plan_id: str,
+    payload: HandoverCreateIn,
+) -> tuple[dict, bool]:
+    """为已确认方案的装船完结交接签发不可变凭证，返回 (凭证快照, 是否重试幂等命中)。
+
+    全部校验在 BEGIN IMMEDIATE 写事务内、基于同一数据库快照完成（读检查不早于
+    拿锁，故并发的更正或补登不会留下旧快照）：方案仍已确认；实绩版本等于期望
+    版本；有效流水号集合与当前全部已登记事件完全一致；逐箱均已在截止前完工；
+    截止之后无有效事件；以冻结排程基线逐箱计算完工延误，任一超过阈值则返回
+    超限箱与偏差（422）、不生成凭证。成功时固化方案修订、各箱实际起止与岸桥、
+    冻结基线、偏差、截止分钟与实绩指纹。同交接号同内容重试返回原凭证（200），
+    同交接号异内容冲突（409）。
+    """
+    # 锁前快速预检：方案须存在且当前已确认（锁内还会再次核对）
+    plan = get_plan(db, plan_id)
+    if plan.status == "draft":
+        raise ConflictError("方案尚未确认（draft），未确认方案拒绝装船完结交接")
+    if plan.status == "superseded":
+        raise ConflictError(
+            "方案修订已被新修订取代（superseded），被取代的方案拒绝装船完结交接"
+        )
+    db.rollback()
+
+    handover_no = payload.handover_no
+    cutoff = payload.cutoff_minute
+    expected_version = payload.expected_actuals_version
+    submitted_seqs = tuple(sorted(set(payload.valid_seqs)))
+    max_delay_allowed = payload.max_finish_delay_minutes
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 1) 生成前在写事务内复核方案仍已确认（未确认/被取代拒绝交接）
+        cursor.execute(
+            "SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,)
+        )
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked, revision_no_locked = prow
+        if plan_status_locked != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"生成前复核发现方案状态已为 {plan_status_locked}（未确认或已被新修订"
+                "取代），本次装船完结交接被拒绝且不生成凭证"
+            )
+
+        # 2) 同交接号幂等/冲突优先判定：重试不受后续实绩变化影响，原样返回
+        cursor.execute(
+            "SELECT id, handover_no, plan_id, revision_no, cutoff_minute, "
+            "expected_actuals_version, actuals_version, max_finish_delay_minutes, "
+            "observed_max_delay_minutes, container_count, actuals_fingerprint, "
+            "valid_seqs_json, created_at, response_snapshot "
+            "FROM loading_handover_vouchers WHERE handover_no = ?",
+            (handover_no,),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            snapshot = json.loads(existing[13])
+            same_request = (
+                existing[2] == plan_id
+                and existing[4] == cutoff
+                and existing[5] == expected_version
+                and existing[7] == max_delay_allowed
+                and tuple(json.loads(existing[11])) == submitted_seqs
+            )
+            if not same_request:
+                conn.rollback()
+                raise ConflictError(
+                    f"交接号 {handover_no} 已用于一次不同内容的交接申请"
+                    "（方案/截止分钟/期望实绩版本/有效流水号集合/最大完工延误任一不同），"
+                    "异内容冲突，本次申请被拒绝且不生成凭证；重试请保持原请求内容，"
+                    "新交接请更换交接号"
+                )
+            idempotent_hit = True
+            conn.commit()
+            return snapshot, idempotent_hit
+
+        # 3) 同一方案至多一份完结交接凭证（完结交接为一次性闭合）
+        cursor.execute(
+            "SELECT handover_no FROM loading_handover_vouchers WHERE plan_id = ?",
+            (plan_id,),
+        )
+        dup_plan = cursor.fetchone()
+        if dup_plan is not None:
+            conn.rollback()
+            raise ConflictError(
+                f"方案 {plan_id} 已完成装船完结交接（交接号 {dup_plan[0]}，凭证不可变），"
+                "不接受第二次交接申请"
+            )
+
+        # 4) 须有已登记实绩（无实绩头：未找到）
+        material = _current_actuals_material(cursor, plan_id)
+        if material is None:
+            conn.rollback()
+            raise BusinessError(
+                f"方案 {plan_id} 尚无已登记装船实绩，不接受装船完结交接", 404
+            )
+        actuals_id, current_version, crane_count, baseline_rows, event_rows = material
+
+        # 5) 期望实绩版本必须仍等于当前版本（并发更正会推进版本）
+        if current_version != expected_version:
+            conn.rollback()
+            raise ConflictError(
+                f"生成前复核发现实绩版本已变化：期望版本 {expected_version}，"
+                f"当前版本 {current_version}（期间可能发生了实绩更正或补登），"
+                "本次装船完结交接被拒绝且不生成凭证；请基于最新实绩重新申请"
+            )
+
+        # 6) 有效流水号集合必须与当前全部已登记事件完全一致
+        registered_seqs = tuple(sorted(r[0] for r in event_rows))
+        if submitted_seqs != registered_seqs:
+            unknown = sorted(set(submitted_seqs) - set(registered_seqs))
+            missing = sorted(set(registered_seqs) - set(submitted_seqs))
+            if unknown:
+                conn.rollback()
+                raise BusinessError(
+                    f"有效流水号 {', '.join(map(str, unknown))} 未在方案 "
+                    f"{plan_id} 的已登记实绩中找到，拒绝交接且不生成凭证",
+                    422,
+                )
+            conn.rollback()
+            raise ConflictError(
+                "生成前复核发现有效事件已变化：申请未覆盖当前已登记流水号 "
+                f"{', '.join(map(str, missing))}（期间可能发生了补登），本次装船完结"
+                "交接被拒绝且不生成凭证；请基于最新实绩重新申请"
+            )
+
+        # 7) 重放全部有效事件，得到每箱实际起止与岸桥
+        cursor.execute(
+            "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+            (plan_id,),
+        )
+        plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+        events = [
+            ActualEvent(
+                seq=r[0], event_type=r[1], container_no=r[2],
+                crane_no=r[3], minute=r[4],
+            )
+            for r in event_rows
+        ]
+        try:
+            replay_result = replay_actuals(events, plan_items, crane_count)
+        except ActualsReplayError as exc:
+            conn.rollback()
+            raise BusinessError(
+                f"已登记实绩重放非法：{exc.reason}，拒绝装船完结交接且不生成凭证",
+                422,
+            )
+        boxes = replay_result["boxes"]
+
+        # 8) 只接受每箱均在截止前完工、且截止后无有效事件的方案
+        unfinished = [
+            no for no, b in boxes.items() if b.status != "finished"
+        ]
+        if unfinished:
+            conn.rollback()
+            raise BusinessError(
+                "仅接受全部箱已完工的方案：箱 "
+                f"{', '.join(sorted(unfinished))} 尚未全部完工，拒绝装船完结交接"
+                "且不生成凭证",
+                422,
+                extra={"unfinished_containers": sorted(unfinished)},
+            )
+        finished_after_cutoff = sorted(
+            no for no, b in boxes.items() if b.finish_minute > cutoff
+        )
+        if finished_after_cutoff:
+            conn.rollback()
+            raise BusinessError(
+                "仅接受每箱均在截止前完工的方案：箱 "
+                f"{', '.join(finished_after_cutoff)} 实际完工晚于截止分钟 {cutoff}，"
+                "拒绝装船完结交接且不生成凭证",
+                422,
+                extra={"containers_finished_after_cutoff": finished_after_cutoff,
+                       "cutoff_minute": cutoff},
+            )
+        events_after_cutoff = sorted(
+            {r[2] for r in event_rows if r[4] > cutoff}
+        )
+        if events_after_cutoff:
+            conn.rollback()
+            raise BusinessError(
+                "截止分钟后存在有效事件（涉及箱 "
+                f"{', '.join(events_after_cutoff)}），拒绝装船完结交接且不生成凭证",
+                422,
+                extra={"containers_with_events_after_cutoff": events_after_cutoff,
+                       "cutoff_minute": cutoff},
+            )
+
+        # 9) 以冻结排程基线逐箱计算完工延误；任一超过阈值返回超限箱与偏差，不生成凭证
+        baseline_by_no = {r[0]: r for r in baseline_rows}
+        item_rows: list[tuple] = []
+        over_limit: list[dict] = []
+        observed_max = 0
+        for no in sorted(boxes):
+            b = boxes[no]
+            base = baseline_by_no.get(no)
+            if base is None:
+                conn.rollback()
+                raise BusinessError(
+                    f"箱 {no} 缺少冻结排程基线快照，数据不一致，拒绝交接", 500
+                )
+            _, stack, tier, b_start, b_finish, b_crane = base
+            start_delta = b.start_minute - b_start
+            finish_delta = b.finish_minute - b_finish
+            delay = finish_delay(b.finish_minute, b_finish)
+            observed_max = max(observed_max, delay)
+            item_rows.append((
+                no, stack, tier,
+                b.start_minute, b.finish_minute, b.crane_no,
+                b_start, b_finish, b_crane,
+                start_delta, finish_delta, b.crane_no != b_crane, delay,
+            ))
+            if delay > max_delay_allowed:
+                over_limit.append({
+                    "container_no": no,
+                    "baseline_finish_minute": b_finish,
+                    "actual_finish_minute": b.finish_minute,
+                    "finish_delay_minutes": delay,
+                    "finish_delta_minutes": finish_delta,
+                    "allowed_max_delay_minutes": max_delay_allowed,
+                    "excess_minutes": delay - max_delay_allowed,
+                })
+        if over_limit:
+            conn.rollback()
+            raise BusinessError(
+                f"{len(over_limit)} 个箱完工延误超过允许阈值 "
+                f"{max_delay_allowed} 分钟，拒绝装船完结交接且不生成凭证",
+                422,
+                extra={"max_finish_delay_minutes": max_delay_allowed,
+                       "over_limit_containers": over_limit},
+            )
+
+        # 10) 全部通过：固化凭证（实绩指纹在同一快照下计算）
+        fingerprint = actuals_fingerprint(
+            version=current_version,
+            baseline_rows=baseline_rows,
+            event_rows=event_rows,
+        )
+        valid_seqs_json = json.dumps(list(submitted_seqs), ensure_ascii=False)
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO loading_handover_vouchers "
+            "(handover_no, plan_id, revision_no, cutoff_minute, "
+            "expected_actuals_version, actuals_version, max_finish_delay_minutes, "
+            "observed_max_delay_minutes, container_count, actuals_fingerprint, "
+            "valid_seqs_json, response_snapshot, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)",
+            (handover_no, plan_id, revision_no_locked, cutoff, expected_version,
+             current_version, max_delay_allowed, observed_max, len(boxes),
+             fingerprint, valid_seqs_json, now),
+        )
+        voucher_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO loading_handover_voucher_items "
+            "(voucher_id, container_no, stack, tier, actual_start_minute, "
+            "actual_finish_minute, actual_crane_no, baseline_start_minute, "
+            "baseline_finish_minute, baseline_crane_no, start_delta_minutes, "
+            "finish_delta_minutes, crane_changed, finish_delay_minutes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(voucher_id, *row) for row in item_rows],
+        )
+
+        # 组装签发响应（签发时刻必然与当前实绩一致）
+        snapshot = {
+            "voucher_no": format(voucher_id, "x"),
+            "handover_no": handover_no,
+            "plan_id": plan_id,
+            "revision_no": revision_no_locked,
+            "plan_status": plan_status_locked,
+            "cutoff_minute": cutoff,
+            "expected_actuals_version": expected_version,
+            "actuals_version": current_version,
+            "current_actuals_version": current_version,
+            "max_finish_delay_minutes": max_delay_allowed,
+            "observed_max_delay_minutes": observed_max,
+            "container_count": len(boxes),
+            "valid_seqs": list(submitted_seqs),
+            "actuals_fingerprint": fingerprint,
+            "current_actuals_fingerprint": fingerprint,
+            "actuals_match": True,
+            "containers": [
+                {
+                    "container_no": r[0],
+                    "stack": r[1],
+                    "tier": r[2],
+                    "actual_start_minute": r[3],
+                    "actual_finish_minute": r[4],
+                    "actual_crane_no": r[5],
+                    "baseline_start_minute": r[6],
+                    "baseline_finish_minute": r[7],
+                    "baseline_crane_no": r[8],
+                    "start_delta_minutes": r[9],
+                    "finish_delta_minutes": r[10],
+                    "crane_changed": bool(r[11]),
+                    "finish_delay_minutes": r[12],
+                }
+                for r in item_rows
+            ],
+            "created_at": utc_iso(_raw_dt(now)),
+        }
+        snapshot["summary"] = _handover_summary(
+            handover_no=handover_no, revision_no=revision_no_locked,
+            cutoff_minute=cutoff, container_count=len(boxes),
+            observed_max_delay=observed_max, max_finish_delay=max_delay_allowed,
+            version=current_version, fingerprint=fingerprint,
+        )
+        cursor.execute(
+            "UPDATE loading_handover_vouchers SET response_snapshot = ? WHERE id = ?",
+            (json.dumps(snapshot, ensure_ascii=False), voucher_id),
+        )
+        conn.commit()
+        return snapshot, idempotent_hit
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+_VOUCHER_SELECT_COLS = (
+    "id, handover_no, plan_id, revision_no, cutoff_minute, "
+    "expected_actuals_version, actuals_version, max_finish_delay_minutes, "
+    "observed_max_delay_minutes, container_count, actuals_fingerprint, "
+    "valid_seqs_json, created_at, response_snapshot"
+)
+
+
+def get_handover_voucher(db: Session, voucher_no: str) -> dict:
+    """按凭证号查询不可变凭证（未知凭证返回 404）；附当前实绩是否仍匹配。"""
+    vid = _parse_voucher_no(voucher_no)
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT {_VOUCHER_SELECT_COLS} FROM loading_handover_vouchers WHERE id = ?",
+            (vid,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise BusinessError(f"凭证 {voucher_no} 不存在", 404)
+        snapshot = _voucher_snapshot_from_row(cursor, row)
+        return _enrich_voucher_snapshot(cursor, snapshot)
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_handover_voucher_by_handover_no(db: Session, handover_no: str) -> dict:
+    """按交接号查询不可变凭证（未知交接号返回 404）；附当前实绩是否仍匹配。"""
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT {_VOUCHER_SELECT_COLS} FROM loading_handover_vouchers "
+            "WHERE handover_no = ?",
+            (handover_no,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise BusinessError(f"交接号 {handover_no} 不存在已签发凭证", 404)
+        snapshot = _voucher_snapshot_from_row(cursor, row)
+        return _enrich_voucher_snapshot(cursor, snapshot)
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_plan_handover_voucher(db: Session, plan_id: str) -> dict:
+    """按方案查询其装船完结交接凭证（方案未知 404；无凭证 404）。"""
+    get_plan(db, plan_id)
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT {_VOUCHER_SELECT_COLS} FROM loading_handover_vouchers "
+            "WHERE plan_id = ?",
+            (plan_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise BusinessError(
+                f"方案 {plan_id} 不存在装船完结交接凭证", 404
+            )
+        snapshot = _voucher_snapshot_from_row(cursor, row)
+        return _enrich_voucher_snapshot(cursor, snapshot)
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def list_handover_vouchers(db: Session) -> list[dict]:
+    """列出全部已签发的装船完结交接凭证（按签发先后），附当前实绩是否仍匹配。"""
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT {_VOUCHER_SELECT_COLS} FROM loading_handover_vouchers ORDER BY id"
+        )
+        rows = cursor.fetchall()
+        return [
+            _enrich_voucher_snapshot(cursor, _voucher_snapshot_from_row(cursor, row))
+            for row in rows
+        ]
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _parse_voucher_no(voucher_no: str) -> int:
+    try:
+        value = int(str(voucher_no), 16)
+    except (TypeError, ValueError):
+        raise BusinessError(f"凭证号 {voucher_no} 格式非法（十六进制编号）", 404)
+    if value <= 0:
+        raise BusinessError(f"凭证 {voucher_no} 不存在", 404)
+    return value

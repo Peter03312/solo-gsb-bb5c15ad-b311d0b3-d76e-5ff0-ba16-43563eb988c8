@@ -40,6 +40,8 @@ def _clean_tables():
     import app.models as models
     db = SessionLocal()
     try:
+        db.query(models.LoadingHandoverVoucherItem).delete()
+        db.query(models.LoadingHandoverVoucher).delete()
         db.query(models.LoadingActualEvent).delete()
         db.query(models.LoadingActualCorrection).delete()
         db.query(models.LoadingActualBaselineItem).delete()

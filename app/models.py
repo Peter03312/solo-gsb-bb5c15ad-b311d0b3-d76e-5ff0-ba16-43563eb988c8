@@ -503,3 +503,92 @@ class LoadingActualCorrection(Base):
         UniqueConstraint("actuals_id", "request_id",
                          name="uq_actual_correction_request"),
     )
+
+
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+class LoadingHandoverVoucher(Base):
+    """装船完结交接成功后签发的**不可变凭证**（按交接号 handover_no 幂等）。
+
+    凭证内容在写事务（BEGIN IMMEDIATE）内核验并固化：申请时提交的方案修订号、
+    各箱实际开工/完工分钟与实际岸桥、冻结排程基线、逐箱完工延误、截止分钟、
+    有效流水号集合以及当时的实绩版本与实绩指纹。凭证一经签发不再改变：后续实绩
+    补登/更正、方案被新修订取代均不改写凭证；查询时重算当前实绩指纹并标示
+    ``actuals_match``（凭证是否仍对应当前实绩）。同交接号同内容重试返回原凭证，
+    同交接号异内容冲突（409）。
+    """
+
+    __tablename__ = "loading_handover_vouchers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # 交接号（业务幂等键，全局唯一）
+    handover_no: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True,
+        index=True,
+    )
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    cutoff_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_actuals_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    actuals_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_finish_delay_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_max_delay_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 签发时刻的实绩指纹（有效事件+冻结基线的规范化哈希）
+    actuals_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 申请时的有效流水号集合（JSON 升序列表）
+    valid_seqs_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # 签发响应的完整快照（JSON 文本），同交接号重试原样返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["LoadingHandoverVoucherItem"]] = relationship(
+        back_populates="voucher", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("cutoff_minute >= 0", name="ck_handover_cutoff"),
+        CheckConstraint("max_finish_delay_minutes >= 0",
+                        name="ck_handover_max_delay"),
+        CheckConstraint("actuals_version >= 1", name="ck_handover_actuals_version"),
+        CheckConstraint("observed_max_delay_minutes >= 0",
+                        name="ck_handover_observed_delay"),
+        CheckConstraint("container_count >= 0", name="ck_handover_container_count"),
+    )
+
+
+class LoadingHandoverVoucherItem(Base):
+    """凭证中逐箱固化的实际起止、岸桥、冻结基线与完工延误。"""
+
+    __tablename__ = "loading_handover_voucher_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    voucher_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_handover_vouchers.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_delta_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    finish_delta_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    crane_changed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # 完工延误：max(实际完工 - 基线完工, 0)
+    finish_delay_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    voucher: Mapped[LoadingHandoverVoucher] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("voucher_id", "container_no",
+                         name="uq_handover_item_container"),
+        CheckConstraint("actual_crane_no >= 1", name="ck_handover_item_crane"),
+        CheckConstraint("baseline_crane_no >= 1", name="ck_handover_item_baseline_crane"),
+        CheckConstraint("finish_delay_minutes >= 0", name="ck_handover_item_delay"),
+    )

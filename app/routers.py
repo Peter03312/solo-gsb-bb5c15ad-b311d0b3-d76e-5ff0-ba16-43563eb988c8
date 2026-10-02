@@ -12,6 +12,8 @@ from app.schemas import (
     ActualEventRegisterIn,
     ActualsOut,
     AssignmentOut,
+    HandoverCreateIn,
+    HandoverVoucherOut,
     ManifestIn,
     ManifestRevisionOut,
     MessageOut,
@@ -418,3 +420,64 @@ def correct_actual_event(
 def get_actuals(plan_id: str, db: Session = Depends(get_db)):
     actuals = services.get_actuals(db, plan_id)
     return services.build_actuals_out(db, actuals)
+
+
+# ---------- 装船完结交接（不可变凭证） ----------
+
+
+@router.post(
+    "/plans/{plan_id}/handovers",
+    response_model=HandoverVoucherOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="装船完结交接：为已确认且实绩齐备的方案签发不可变凭证（同交接号幂等）",
+)
+def create_handover(
+    plan_id: str,
+    body: HandoverCreateIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    snapshot, idempotent_hit = services.issue_handover_voucher(db, plan_id, body)
+    # 同交接号同内容重试返回原凭证（200）；首次签发为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return snapshot
+
+
+@router.get(
+    "/handovers",
+    response_model=list[HandoverVoucherOut],
+    summary="列出全部装船完结交接凭证（不可变；标示是否仍对应当前实绩）",
+)
+def list_handovers(db: Session = Depends(get_db)):
+    return services.list_handover_vouchers(db)
+
+
+@router.get(
+    "/handovers/by-no/{handover_no}",
+    response_model=HandoverVoucherOut,
+    responses={404: {"model": MessageOut}},
+    summary="按交接号查询装船完结交接凭证",
+)
+def get_handover_by_no(handover_no: str, db: Session = Depends(get_db)):
+    return services.get_handover_voucher_by_handover_no(db, handover_no)
+
+
+@router.get(
+    "/handovers/{voucher_no}",
+    response_model=HandoverVoucherOut,
+    responses={404: {"model": MessageOut}},
+    summary="按凭证号查询装船完结交接凭证（含 actuals_match 当前实绩一致性标示）",
+)
+def get_handover(voucher_no: str, db: Session = Depends(get_db)):
+    return services.get_handover_voucher(db, voucher_no)
+
+
+@router.get(
+    "/plans/{plan_id}/handovers",
+    response_model=HandoverVoucherOut,
+    responses={404: {"model": MessageOut}},
+    summary="按方案查询其装船完结交接凭证（历史凭证仍可读）",
+)
+def get_plan_handover(plan_id: str, db: Session = Depends(get_db)):
+    return services.get_plan_handover_voucher(db, plan_id)
